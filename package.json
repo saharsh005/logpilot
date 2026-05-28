@@ -1,0 +1,36 @@
+{
+  "name": "logpilot",
+  "version": "1.0.0",
+  "description": "Zero-config monitoring, NLP log search, and self-healing for Node.js apps",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "README.md",
+    "logpilot.config.example.js"
+  ],
+  "scripts": {
+    "test": "node test/smoke.js",
+    "demo": "node test/demo-app.js"
+  },
+  "keywords": [
+    "monitoring",
+    "logging",
+    "self-healing",
+    "nlp",
+    "devops",
+    "observability",
+    "circuit-breaker"
+  ],
+  "author": "logpilot",
+  "license": "MIT",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@qdrant/js-client-rest": "^1.18.0",
+    "chalk": "^4.1.2",
+    "cron": "^3.1.6",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "sql.js": "^1.14.1",
+    "ws": "^8.16.0"
+  }
+}

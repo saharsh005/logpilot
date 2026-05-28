@@ -1,0 +1,12 @@
+.logpilot/
+.logpilot-*/
+node_modules/
+npm-debug.log*
+
+test/
+# Demo output and generated demo files
+*.demo.log
+demo.log
+demo.err.log
+
+logpilot.config.example.js
