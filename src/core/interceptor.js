@@ -61,8 +61,10 @@ function createMiddleware(config) {
         },
       };
 
-      // Store to DB
-      db.insertLog(entry);
+      // Store raw log and attach endpoint failures to a durable incident group.
+      const logId = db.insertLog(entry);
+      const incident = db.recordIncident(entry, logId);
+      if (incident) entry.incidentGroupId = incident.id;
 
       // Async vector indexing — runs after response is sent, never blocks
       setImmediate(() => indexLogVector(entry).catch(() => {}));
@@ -147,7 +149,9 @@ function logCustom(level, message, metadata = {}) {
     metadata,
     service: metadata.service || 'app',
   };
-  db.insertLog(entry);
+  const logId = db.insertLog(entry);
+  const incident = db.recordIncident(entry, logId);
+  if (incident) entry.incidentGroupId = incident.id;
   notifyLogSubscribers(entry);
 }
 

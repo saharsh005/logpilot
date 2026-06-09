@@ -1,6 +1,6 @@
 # ⚡ logpilot
 
-> Zero-config monitoring, NLP log search, and self-healing for Node.js apps.
+> Config-first monitoring, grouped incident timelines, NLP log search, and self-healing for Node.js apps.
 
 ```bash
 npm install logpilot
@@ -11,7 +11,7 @@ import logpilot from 'logpilot';
 logpilot.init({ app, healEnabled: true });
 ```
 
-That's it. Your app is now monitored, searchable, and self-healing.
+That's enough to start. Add `logpilot.config.js` when you want endpoint-specific remediation.
 
 ---
 
@@ -19,13 +19,14 @@ That's it. Your app is now monitored, searchable, and self-healing.
 
 | Feature | Description |
 |---|---|
-| **Auto monitoring** | Wraps every Express route — captures latency, errors, status codes |
+| **HTTP monitoring** | Wraps every Express route and captures latency, errors, and status codes |
 | **System metrics** | Tracks CPU, memory, event loop lag every 5 seconds |
+| **Incident groups** | Collects repeated endpoint errors into one group with a clickable timeline |
 | **NLP log search** | Query logs in plain English: *"show payment failures last night"* |
-| **Anomaly detection** | EWMA-based baselines per route — flags deviations automatically |
-| **Self-healing** | Circuit breaking, GC, restart, scale — defined in a config file |
-| **Live dashboard** | Real-time UI at `localhost:4321` with WebSocket log stream |
-| **Zero dependencies on infra** | No Redis, no Docker, no cloud — just SQLite locally |
+| **Anomaly detection** | EWMA-based baselines per route flag deviations automatically |
+| **Self-healing** | Endpoint rate limiting, circuit breaking, GC, restart, and scale rules from config |
+| **Live dashboard** | Real-time UI at `localhost:4321` with incident groups and WebSocket log stream |
+| **Low infra footprint** | No Redis, no Docker, no cloud required for local SQLite mode |
 
 ---
 
@@ -101,6 +102,18 @@ module.exports = {
 
   healRules: [
     {
+      name: 'Payment endpoint failure burst',
+      trigger: {
+        endpoint: '/api/payment',
+        statusClass: '5xx',
+        minOccurrences: 5,
+      },
+      action: 'rate-limit',
+      maxRequests: 30,
+      window: '1 minute',
+      duration: '10 minutes',
+    },
+    {
       name: 'Payment high error rate',
       trigger: { service: '/api/payment', errorRate: '> 20%' },
       action: 'circuit-break',
@@ -127,11 +140,29 @@ module.exports = {
 
 | Action | What it does |
 |---|---|
+| `rate-limit` | Temporarily applies per-client request limiting for a matching endpoint |
 | `circuit-break` | Returns 503 for matching routes for a configurable duration |
 | `restart-service` | Calls `process.exit(1)` — use with PM2 or nodemon for auto-restart |
 | `gc` | Triggers `global.gc()` (run node with `--expose-gc`) |
 | `scale-replicas` | Emits a scale signal (requires orchestrator integration) |
 | `notify-only` | Sends alert without taking action |
+| `custom-hook` | Runs a config-provided async handler for custom remediation |
+
+Endpoint rules can match collected incident groups:
+
+```js
+{
+  name: 'Checkout 5xx protection',
+  trigger: {
+    endpoint: '/api/checkout',
+    method: 'POST',
+    statusClass: '5xx',
+    minOccurrences: 3,
+  },
+  action: 'circuit-break',
+  duration: '5 minutes',
+}
+```
 
 ---
 
@@ -192,12 +223,22 @@ Data is automatically cleaned up after 7 days via a 3am cron job.
 
 ---
 
-## Roadmap
+## Current Focus And Roadmap
 
-- [ ] PostgreSQL storage backend for multi-instance deployments
-- [ ] Kubernetes-native heal actions via k8s API
-- [ ] Vector embeddings for true semantic search
-- [ ] Distributed tracing integration (OpenTelemetry)
+- [x] Group repeated endpoint errors into incident groups
+- [x] Show incident timelines from the grouped dashboard view
+- [x] Execute config-driven HTTP endpoint actions
+- [x] Automatic rate limiting policy suggestions
+- [x] Heap snapshots before restart
+- [x] **NEW:** Trace-ID based incident correlation across services
+- [x] **NEW:** Link heal actions to incidents in timeline
+- [x] **NEW:** Heap snapshot health analysis with memory pressure alerts
+- [x] **NEW:** Custom remediation hooks support
+- [ ] OpenTelemetry ingestion
+- [ ] PostgreSQL/Redis awareness
+- [ ] Docker support
+- [ ] Kubernetes support
+- [ ] Advanced root-cause correlation (transactional tracing)
 - [ ] Web-based alert rule editor
 - [ ] npm publish
 
