@@ -103,11 +103,33 @@ async function initDB(storageDir) {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS incident_analysis (
+      incident_id INTEGER PRIMARY KEY,
+      updated_at INTEGER NOT NULL,
+      context_json TEXT,
+      rca_json TEXT,
+      recovery_json TEXT,
+      postmortem_md TEXT
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS evidence_snapshots (
+      incident_id INTEGER PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      source TEXT,
+      evidence_json TEXT NOT NULL,
+      ttl_seconds INTEGER DEFAULT 3600
+    )
+  `);
+
   db.run(`CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_logs_path ON logs(path)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_incident_groups_last_seen ON incident_groups(last_seen)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_incident_events_group_id ON incident_events(group_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_evidence_created ON evidence_snapshots(created_at)`);
 
   persistDB();
   return db;
@@ -358,6 +380,40 @@ function getIncidentTimeline(groupId, limit = 100) {
   );
 }
 
+function upsertIncidentAnalysis(incidentId, analysis) {
+  if (!db || !incidentId) return;
+  try {
+    db.run(
+      `INSERT OR REPLACE INTO incident_analysis
+       (incident_id, updated_at, context_json, rca_json, recovery_json, postmortem_md)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        incidentId,
+        Date.now(),
+        JSON.stringify(analysis.context || {}),
+        JSON.stringify(analysis.rca || {}),
+        JSON.stringify(analysis.recovery || {}),
+        analysis.postmortem || '',
+      ]
+    );
+    persistDB();
+  } catch (e) { /* silent */ }
+}
+
+function getIncidentAnalysis(incidentId) {
+  if (!db || !incidentId) return null;
+  const row = execQuery(`SELECT * FROM incident_analysis WHERE incident_id = ? LIMIT 1`, [incidentId])[0];
+  if (!row) return null;
+  return {
+    incidentId: row.incident_id,
+    updatedAt: row.updated_at,
+    context: safeJson(row.context_json, {}),
+    rca: safeJson(row.rca_json, {}),
+    recovery: safeJson(row.recovery_json, {}),
+    postmortem: row.postmortem_md || '',
+  };
+}
+
 function getRelatedIncidents(groupId) {
   if (!db) return [];
   const group = getIncidentGroup(groupId);
@@ -384,6 +440,54 @@ function getStats() {
   return { totalLogs, errorLogs, healCount, incidentGroups, avgResponseMs: Math.round(avgResponse) };
 }
 
+function getDashboardAnalytics({ since = Date.now() - 24 * 60 * 60 * 1000 } = {}) {
+  if (!db) return {};
+  return {
+    statusClasses: execQuery(
+      `SELECT
+         CASE
+           WHEN status_code >= 500 THEN '5xx'
+           WHEN status_code >= 400 THEN '4xx'
+           WHEN status_code >= 300 THEN '3xx'
+           WHEN status_code >= 200 THEN '2xx'
+           ELSE 'other'
+         END as label,
+         COUNT(*) as value
+       FROM logs
+       WHERE timestamp >= ? AND status_code IS NOT NULL
+       GROUP BY label
+       ORDER BY label`,
+      [since]
+    ),
+    rootCauses: execQuery(
+      `SELECT COALESCE(root_cause, 'Unknown') as label, COUNT(*) as value
+       FROM incident_groups
+       WHERE last_seen >= ?
+       GROUP BY root_cause
+       ORDER BY value DESC
+       LIMIT 8`,
+      [since]
+    ),
+    healActions: execQuery(
+      `SELECT action as label, COUNT(*) as value
+       FROM heal_actions
+       WHERE timestamp >= ?
+       GROUP BY action
+       ORDER BY value DESC
+       LIMIT 8`,
+      [since]
+    ),
+    metricSeries: execQuery(
+      `SELECT timestamp, cpu_percent, memory_percent, event_loop_lag
+       FROM metrics
+       WHERE timestamp >= ?
+       ORDER BY timestamp ASC
+       LIMIT 120`,
+      [since]
+    ),
+  };
+}
+
 function execQuery(sql, params) {
   try {
     const stmt = db.prepare(sql);
@@ -405,7 +509,13 @@ function cleanup(days = 7) {
   db.run(`DELETE FROM incident_events WHERE timestamp < ?`, [cutoff]);
   db.run(`DELETE FROM incident_groups WHERE last_seen < ?`, [cutoff]);
   db.run(`DELETE FROM heap_snapshots WHERE timestamp < ?`, [cutoff]);
+  db.run(`DELETE FROM incident_analysis WHERE updated_at < ?`, [cutoff]);
   persistDB();
+}
+
+function safeJson(value, fallback) {
+  try { return value ? JSON.parse(value) : fallback; }
+  catch (e) { return fallback; }
 }
 
 function isIncidentEntry(entry) {
@@ -448,11 +558,51 @@ function buildIncidentTitle(entry, rootCause) {
   return `${rootCause}${status} on ${endpoint}`;
 }
 
+function queryMetrics({ since, until, limit = 120 } = {}) {
+  if (!db) return [];
+  let sql = `SELECT * FROM metrics WHERE 1=1`;
+  const params = [];
+  if (since) { sql += ` AND timestamp >= ?`; params.push(since); }
+  if (until) { sql += ` AND timestamp <= ?`; params.push(until); }
+  sql += ` ORDER BY timestamp DESC LIMIT ?`;
+  params.push(limit);
+  return execQuery(sql, params);
+}
+
+function saveEvidenceSnapshot(incidentId, bundle) {
+  if (!db) return;
+  try {
+    db.run(
+      `INSERT OR REPLACE INTO evidence_snapshots (incident_id, created_at, source, evidence_json, ttl_seconds)
+       VALUES (?, ?, ?, ?, ?)`,
+      [incidentId, Date.now(), bundle.source || 'local', JSON.stringify(bundle), 3600]
+    );
+    persistDB();
+  } catch (err) {
+    // Silent fail
+  }
+}
+
+function getEvidenceSnapshot(incidentId) {
+  if (!db) return null;
+  try {
+    const rows = execQuery(
+      `SELECT * FROM evidence_snapshots WHERE incident_id = ? LIMIT 1`,
+      [incidentId]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    return null;
+  }
+}
+
 module.exports = {
   initDB, insertLog, recordIncident, insertMetric, insertHealAction,
   insertHeapSnapshot, getHeapSnapshots,
-  queryLogs, queryLogsByKeywords, getRecentMetrics, getLatestMetric,
+  queryLogs, queryLogsByKeywords, getRecentMetrics, getLatestMetric, queryMetrics,
   getErrorRate, getHealActions, getIncidentGroups, getIncidentGroup,
   getIncidentTimeline, getRelatedIncidents, markIncidentAction,
-  getStats, cleanup, persistDB,
+  upsertIncidentAnalysis, getIncidentAnalysis,
+  saveEvidenceSnapshot, getEvidenceSnapshot,
+  getStats, getDashboardAnalytics, cleanup, persistDB,
 };

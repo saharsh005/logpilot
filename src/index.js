@@ -19,6 +19,7 @@ const { search }          = require('./nlp/search-engine');
 const { cleanup }         = require('./storage/db');
 const { initEmbedder }    = require('./nlp/embedder');
 const vectorStore         = require('./nlp/vector-store');
+const { initSplunkService } = require('./integrations/splunk/service');
 
 let _config = {};
 let _initialized = false;
@@ -88,6 +89,9 @@ async function init(options = {}) {
 
   // ── Init DB ───────────────────────────────────────────────
   await db.initDB(_config.storageDir);
+
+  // ── Init Splunk service ────────────────────────────────────
+  initSplunkService(_config);
 
   // ── Start metrics collection ──────────────────────────────
   startMetricsCollection(5000);
@@ -184,4 +188,43 @@ function status() {
   };
 }
 
-module.exports = { init, log, query, metrics, status };
+// ── Phase 12: Graceful shutdown ──────────────────────────────────────────
+
+async function shutdown(signal = 'SIGTERM') {
+  const chalk = require('chalk');
+  console.log(chalk.cyan('[logpilot]'), chalk.yellow(`Graceful shutdown (${signal})…`));
+
+  // Stop heal engine
+  if (_healInterval) { clearInterval(_healInterval); _healInterval = null; }
+
+  // Flush and close Splunk HEC — drain any queued events before exit
+  try {
+    const { getService } = require('./integrations/splunk/service');
+    const splunk = getService();
+    if (splunk?.isEnabled()) {
+      console.log(chalk.cyan('[logpilot]'), chalk.gray('Flushing Splunk HEC queue…'));
+      await splunk.close();
+      console.log(chalk.cyan('[logpilot]'), chalk.green('✓ Splunk HEC flushed'));
+    }
+  } catch (e) {}
+
+  // Persist SQLite to disk
+  try { db.persistDB(); } catch (e) {}
+
+  console.log(chalk.cyan('[logpilot]'), chalk.green('✓ Shutdown complete'));
+}
+
+// Auto-register signal handlers (idempotent)
+let _shutdownRegistered = false;
+function _registerShutdownHandlers() {
+  if (_shutdownRegistered) return;
+  _shutdownRegistered = true;
+  const handle = sig => async () => {
+    await shutdown(sig).catch(() => {});
+    process.exit(0);
+  };
+  process.once('SIGTERM', handle('SIGTERM'));
+  process.once('SIGINT',  handle('SIGINT'));
+}
+
+module.exports = { init, log, query, metrics, status, shutdown };

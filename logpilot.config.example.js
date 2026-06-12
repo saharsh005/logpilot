@@ -1,154 +1,115 @@
 /**
- * logpilot.config.js
- * ───────────────────────────────────────────────────────────────────────────
- * Drop this file (renamed to logpilot.config.js) in your project root.
- * LogPilot picks it up automatically on init.
+ * LogPilot — Full configuration example
+ * Copy to logpilot.config.js in your project root.
  *
- * FOCUSED SCOPE: HTTP endpoint monitoring + automated remediation.
- * Future: database, queue, and external-service monitoring.
+ * Every option has a sensible default — only configure what you need.
  */
 
 module.exports = {
-  // ── Service map ──────────────────────────────────────────────────────────
-  // Maps friendly names to Express route prefixes.
-  // Anomaly detection and heal rules match against these names/paths.
-  services: {
-    payment:  '/api/payment',
-    auth:     '/api/auth',
-    catalog:  '/api/catalog',
-    orders:   '/api/orders',
+  // ── Express app (required) ────────────────────────────────────────────────
+  // app: require('./app'),  // pass your Express instance here
+
+  // ── Dashboard ─────────────────────────────────────────────────────────────
+  dashboard:     true,
+  dashboardPort: 4321,
+  consoleOutput: true,
+  storageDir:    '.logpilot',   // SQLite + snapshots go here
+
+  // ── Splunk Integration (Phase 1 + 11) ────────────────────────────────────
+  splunk: {
+    enabled:            process.env.SPLUNK_ENABLED === 'true' || false,
+
+    // HTTP Event Collector (HEC) — for sending events TO Splunk
+    hecUrl:             process.env.SPLUNK_HEC_URL   || 'http://localhost:8088',
+    token:              process.env.SPLUNK_HEC_TOKEN || '',   // HEC token
+    index:              process.env.SPLUNK_INDEX     || 'logpilot',
+
+    // Splunk REST API — for searching evidence FROM Splunk
+    host:               process.env.SPLUNK_HOST      || 'localhost',
+    port:               process.env.SPLUNK_PORT      || 8089,
+    protocol:           process.env.SPLUNK_PROTOCOL  || 'https',
+    username:           process.env.SPLUNK_USERNAME,           // basic auth
+    password:           process.env.SPLUNK_PASSWORD,           // or use token below
+    // token:           process.env.SPLUNK_TOKEN,              // bearer token for REST API
+
+    // TLS (set false for self-signed dev certs)
+    rejectUnauthorized: process.env.SPLUNK_REJECT_TLS !== 'false',
+
+    // HEC tuning
+    batchSize:          100,    // events per HEC batch
+    flushInterval:      5000,   // ms between auto-flushes
+    maxQueueSize:       1000,   // max queued events before backpressure
+    maxDLQSize:         500,    // dead-letter queue size
+    retryAttempts:      3,      // retries before DLQ
   },
 
-  // ── Anomaly detection thresholds ─────────────────────────────────────────
-  thresholds: {
-    errorRatePercent:   15,    // alert if >15% of requests to a service fail
-    memoryUsagePercent: 85,    // alert if process RSS > 85%
-    responseTimeMs:     2000,  // alert if p95 latency exceeds 2s
+  // ── AI Investigation (Phase 5) ───────────────────────────────────────────
+  ai: {
+    provider:    process.env.LOGPILOT_AI_PROVIDER || '',  // 'openai' | 'groq' | 'ollama'
+    model:       process.env.LOGPILOT_AI_MODEL    || '',  // e.g. 'gpt-4o-mini'
+    apiKey:      process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || '',
+    baseUrl:     process.env.OLLAMA_BASE_URL || 'http://localhost:11434',  // Ollama only
+    temperature: 0.2,
+    maxTokens:   1024,
   },
 
-  // ── Self-healing rules ────────────────────────────────────────────────────
-  // Evaluated every 30s. Each rule watches a trigger condition and fires
-  // an action if matched (with a 10-minute cooldown between firings).
-  //
-  // Supported actions for HTTP endpoints:
-  //   rate-limit      → throttle requests to the endpoint (429)
-  //   circuit-break   → block the endpoint entirely (503) for a duration
-  //   heap-snapshot   → capture memory snapshot for analysis (no restart)
-  //   restart-service → capture heap snapshot then exit(1) (use with PM2/nodemon)
-  //   gc              → force V8 garbage collection (requires --expose-gc)
-  //   notify-only     → alert without taking action
-  //   custom-hook     → call your own async handler function
-  //
-  // Trigger conditions:
-  //   endpoint / path / service  → match by route prefix
-  //   statusCode                 → exact HTTP status (e.g. 500)
-  //   statusClass                → status range (e.g. '5xx', '4xx')
-  //   minOccurrences / count     → minimum error count in the incident window
-  //   errorRate                  → e.g. '> 20%'  (uses anomaly detector)
-  //   metric                     → 'memory' | 'cpu' | 'event-loop'
-  //   rootCause / cause          → match inferred root cause string
+  // ── MCP Tool Integration (Phase 6) ──────────────────────────────────────
+  mcp: {
+    enabled:       false,   // set true to enable AI → Splunk tool calls
+    maxToolRounds: 3,       // max agentic tool-call loops per investigation
+  },
+
+  // ── Self-Healing Engine ───────────────────────────────────────────────────
+  healEnabled: false,
+  dryRun:      false,        // true = log what would happen, never execute
+
   healRules: [
-    // ── Rate-limit a burst of 5xx errors on the payment endpoint ────────────
+    // Memory pressure → force GC, capture snapshot, restart if critical
     {
-      name: 'Payment endpoint failure burst',
-      trigger: {
-        endpoint: '/api/payment',
-        statusClass: '5xx',
-        minOccurrences: 5,
-      },
-      action: 'rate-limit',
-      maxRequests: 30,          // allow 30 req per window
-      window: '1 minute',
-      duration: '10 minutes',   // auto-restores after 10 min
-      notify: ['console'],
-    },
-
-    // ── Circuit-break when payment error rate is sustained ───────────────
-    {
-      name: 'Payment service high error rate',
-      trigger: {
-        service: '/api/payment',
-        errorRate: '> 20%',
-      },
-      action: 'circuit-break',
-      duration: '10 minutes',
-      notify: ['console'],
-    },
-
-    // ── Capture heap snapshot + restart on memory pressure ──────────────
-    {
-      name: 'Memory pressure — restart with snapshot',
-      trigger: {
-        metric: 'memory',
-        threshold: '> 88%',
-      },
-      action: 'restart-service',  // captures heap snapshot automatically before exit
-      notify: ['console'],
-    },
-
-    // ── Heap snapshot only (no restart) for moderate memory usage ───────
-    {
-      name: 'Moderate memory — snapshot for analysis',
-      trigger: {
-        metric: 'memory',
-        threshold: '> 75%',
-      },
-      action: 'heap-snapshot',
-      notify: ['console'],
-    },
-
-    // ── Force GC before memory gets critical ─────────────────────────────
-    {
-      name: 'Force GC on elevated memory',
-      trigger: {
-        metric: 'memory',
-        threshold: '> 70%',
-      },
+      name:   'High memory',
+      trigger: { metric: 'memory', threshold: '> 85%' },
       action: 'gc',
-      notify: ['console'],
+      cooldown: '10 minutes',
     },
 
-    // ── Notify-only for auth anomalies ────────────────────────────────────
+    // Endpoint error burst → circuit break
     {
-      name: 'Auth anomaly — alert only',
-      trigger: {
-        service: '/api/auth',
-        anomalyScore: '> 0.85',
-      },
-      action: 'notify-only',
-      notify: ['console'],
+      name:    'API error burst',
+      trigger: { endpoint: '/api', statusClass: '5xx', minOccurrences: 5 },
+      action:  'circuit-break',
+      options: { windowMs: 60000, failureThreshold: 5, resetTimeout: 30000 },
     },
 
-    // ── Custom hook example ───────────────────────────────────────────────
+    // Rate limit abuse
     {
-      name: 'Custom webhook on catalog errors',
-      trigger: {
-        endpoint: '/api/catalog',
-        statusClass: '5xx',
-        minOccurrences: 10,
-      },
-      action: 'custom-hook',
-      handler: async ({ rule, anomaly, config }) => {
-        // Your custom logic here — e.g. call an internal API, page someone, etc.
-        console.log('[custom-hook]', rule.name, anomaly.message);
-      },
-      notify: ['console'],
+      name:    'Rate limit abuse',
+      trigger: { endpoint: '/api', statusCode: 429, minOccurrences: 10 },
+      action:  'rate-limit',
+      options: { max: 50, windowMs: 60000 },
     },
   ],
 
-  // ── Notification targets ──────────────────────────────────────────────────
-  alerts: {
-    slack: process.env.SLACK_WEBHOOK_URL,
-    // pagerduty: process.env.PAGERDUTY_KEY,  // future
+  // ── Service labels (optional) ────────────────────────────────────────────
+  // Map URL prefixes to service names shown in the dashboard
+  services: {
+    api:  '/api',
+    auth: '/auth',
+    web:  '/',
   },
 
-  // ── Dashboard ─────────────────────────────────────────────────────────────
-  dashboardPort: 4321,
+  // ── Alert thresholds ─────────────────────────────────────────────────────
+  thresholds: {
+    responseTimeMs: 2000,     // warn above this
+    errorRatePercent: 5,      // trigger incident grouping
+    memoryPercent: 85,        // high memory alert
+    cpuPercent: 80,           // high CPU alert
+    eventLoopLagMs: 100,      // event loop lag alert
+  },
 
-  // ── Optional overrides ────────────────────────────────────────────────────
-  // consoleOutput: true,        // log requests to terminal
-  // dryRun: false,              // simulate heals without executing
-  // semanticSearch: true,       // enable NLP search (requires Qdrant)
-  // qdrantUrl: 'http://localhost:6333',
-  // incidentWindow: '10 minutes', // window for incident grouping
+  // ── Semantic search (NLP) ────────────────────────────────────────────────
+  semanticSearch: true,
+  qdrantUrl:      'http://localhost:6333',  // vector DB (optional)
+
+  // ── Recovery verification ────────────────────────────────────────────────
+  recoveryWindowMs: 5 * 60 * 1000,  // 5 minutes post-action monitoring window
 };

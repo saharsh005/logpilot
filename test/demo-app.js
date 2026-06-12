@@ -15,6 +15,8 @@
  * Open:  http://localhost:4321
  */
 
+require('dotenv').config();
+
 const express = require('express');
 const logpilot = require('../src/index');
 
@@ -23,71 +25,134 @@ app.use(express.json());
 
 logpilot.init({
   app,
-  healEnabled:   true,
-  dashboard:     true,
+
+  // Core
+  healEnabled: true,
+  dashboard: true,
   dashboardPort: 4321,
-  dryRun:        false,
+  dryRun: false,
   consoleOutput: true,
+
+  // Splunk Integration
+  splunk: {
+    enabled: true,
+
+    // HEC
+    hecUrl: process.env.SPLUNK_HEC_URL,
+    token: process.env.SPLUNK_HEC_TOKEN,
+    index: process.env.SPLUNK_INDEX || 'logpilot',
+
+    // Search API
+    host: process.env.SPLUNK_HOST || 'localhost',
+    port: process.env.SPLUNK_PORT || 8089,
+    protocol: process.env.SPLUNK_PROTOCOL || 'https',
+    username: process.env.SPLUNK_USERNAME,
+    password: process.env.SPLUNK_PASSWORD,
+
+    rejectUnauthorized: false,
+
+    batchSize: 100,
+    flushInterval: 5000,
+    retryAttempts: 3,
+    maxQueueSize: 1000
+  },
+
+  // AI Investigator
+  ai: {
+    provider: process.env.LOGPILOT_AI_PROVIDER || 'groq',
+    apiKey: process.env.GROQ_API_KEY,
+    model: process.env.LOGPILOT_AI_MODEL || 'llama-3.3-70b-versatile',
+    temperature: 0.2,
+    maxTokens: 1024
+  },
+
+  // MCP Agent Tools
+  mcp: {
+    enabled: true,
+    maxToolRounds: 3
+  },
 
   services: {
     payment: '/api/payment',
-    auth:    '/api/auth',
+    auth: '/api/auth',
     catalog: '/api/catalog',
-    orders:  '/api/orders',
+    orders: '/api/orders'
   },
 
   thresholds: {
-    errorRatePercent:   20,
+    errorRatePercent: 20,
     memoryUsagePercent: 85,
-    responseTimeMs:     1500,
+    responseTimeMs: 1500
   },
 
   healRules: [
-    // Demo 1 — Rate-limit payment errors
     {
       name: 'Payment: rate-limit on failure burst',
-      trigger: { endpoint: '/api/payment', statusClass: '5xx', minOccurrences: 5 },
+      trigger: {
+        endpoint: '/api/payment',
+        statusClass: '5xx',
+        minOccurrences: 5
+      },
       action: 'rate-limit',
       maxRequests: 5,
       window: '1 minute',
       duration: '2 minutes',
-      notify: ['console'],
+      notify: ['console']
     },
-    // Demo 2 — Circuit-break high error rate
+
     {
       name: 'Payment: circuit-break high error rate',
-      trigger: { service: '/api/payment', errorRate: '> 30%' },
+      trigger: {
+        service: '/api/payment',
+        errorRate: '> 30%'
+      },
       action: 'circuit-break',
       duration: '2 minutes',
-      notify: ['console'],
+      notify: ['console']
     },
-    // Demo 3 — Heap snapshot on elevated memory
+
     {
       name: 'Memory: capture heap snapshot',
-      trigger: { metric: 'memory', threshold: '> 50%' },
+      trigger: {
+        metric: 'memory',
+        threshold: '> 50%'
+      },
       action: 'heap-snapshot',
-      notify: ['console'],
+      notify: ['console']
     },
-    // Demo 4 — GC on memory pressure
+
     {
       name: 'Memory: force GC',
-      trigger: { metric: 'memory' },
+      trigger: {
+        metric: 'memory'
+      },
       action: 'gc',
-      notify: ['console'],
+      notify: ['console']
     },
-    // Demo 5 — Custom hook on catalog errors
+
     {
       name: 'Catalog: custom webhook alert',
-      trigger: { endpoint: '/api/catalog', statusClass: '5xx', minOccurrences: 8 },
+      trigger: {
+        endpoint: '/api/catalog',
+        statusClass: '5xx',
+        minOccurrences: 8
+      },
       action: 'custom-hook',
       handler: async ({ rule, anomaly }) => {
-        // In production: call PagerDuty, your webhook, etc.
-        console.log(`[demo-hook] ${rule.name}: ${anomaly.message}`);
+        console.log(
+          `[demo-hook] ${rule.name}: ${anomaly.message}`
+        );
       },
-      notify: ['console'],
-    },
-  ],
+      notify: ['console']
+    }
+  ]
 });
+
+const { getService } = require('../src/integrations/splunk/service');
+
+setTimeout(() => {
+  console.log("SPLUNK SERVICE:", getService()?.getHealth());
+}, 5000);
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 

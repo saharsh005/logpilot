@@ -8,6 +8,7 @@
 const db = require('../storage/db');
 const { detectAnomalies } = require('../core/anomaly-detector');
 const { captureSnapshot } = require('../heap/snapshot');
+const { getService: getSplunkService } = require('../integrations/splunk/service');
 
 const circuitBreakers = {};
 const rateLimits = {};
@@ -241,6 +242,21 @@ async function executeAction(rule, anomaly, config) {
   if (anomaly.incidentGroupId) {
     db.markIncidentAction(anomaly.incidentGroupId, rule.action);
   }
+
+  // Send heal event to Splunk HEC using typed emitter (non-blocking)
+  setImmediate(() => {
+    const splunk = getSplunkService();
+    if (!splunk?.isEnabled()) return;
+    splunk.sendHeal({
+      rule_name:     rule.name,
+      action:        rule.action,
+      trigger_detail: anomaly.path || anomaly.type,
+      success,
+      notes,
+    }).catch(() => {});
+    // Also emit anomaly event that triggered the heal
+    splunk.sendAnomaly(anomaly).catch(() => {});
+  });
 
   if (rule.notify) {
     await sendNotifications(rule.notify, rule, anomaly, notes, config);

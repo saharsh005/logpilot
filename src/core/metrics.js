@@ -1,4 +1,5 @@
 const db = require('../storage/db');
+const { getService: getSplunkService } = require('../integrations/splunk/service');
 
 let metricsInterval = null;
 let eventLoopInterval = null;
@@ -18,6 +19,24 @@ function startMetricsCollection(intervalMs = 5000) {
     const metric = collectMetrics();
     db.insertMetric(metric);
     notifySubscribers(metric);
+
+    // Send sample of metrics to Splunk (10% sample rate to reduce volume)
+    if (Math.random() < 0.1) {
+      setImmediate(() => {
+        const splunk = getSplunkService();
+        if (splunk?.isEnabled()) {
+          splunk.sendEvent('metric', {
+            cpu: metric.cpu,
+            memory: metric.memoryPercent,
+            memoryMb: metric.memoryMb,
+            eventLoopLag: metric.eventLoopLag,
+            heapUsedMb: metric.heapUsedMb,
+            heapTotalMb: metric.heapTotalMb,
+            timestamp: metric.timestamp,
+          }).catch(() => {});
+        }
+      });
+    }
   }, intervalMs);
 
   // Don't block process exit

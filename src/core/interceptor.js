@@ -2,6 +2,7 @@ const db = require('../storage/db');
 const { updateBaseline } = require('./anomaly-detector');
 const { embed, buildLogText, isReady: embedderReady } = require('../nlp/embedder');
 const vectorStore = require('../nlp/vector-store');
+const { getService: getSplunkService } = require('../integrations/splunk/service');
 
 // Counter for generating Qdrant-compatible integer IDs
 let vectorIdCounter = Date.now();
@@ -74,6 +75,28 @@ function createMiddleware(config) {
 
       // Push to real-time subscribers (dashboard WebSocket)
       notifyLogSubscribers(entry);
+
+      // Send to Splunk HEC (non-blocking, fire-and-forget)
+      setImmediate(() => {
+        const splunk = getSplunkService();
+        if (!splunk?.isEnabled()) return;
+        splunk.sendRequest(entry).catch(() => {});
+        // Emit error event for 5xx responses
+        if (entry.statusCode >= 500) {
+          splunk.sendEvent('error', {
+            method:       entry.method,
+            path:         entry.path,
+            statusCode:   entry.statusCode,
+            responseTime: entry.responseTime,
+            service:      entry.service,
+            message:      entry.message,
+          }).catch(() => {});
+        }
+        // Emit incident event when a new group is created or updated
+        if (incident) {
+          splunk.sendIncident(incident).catch(() => {});
+        }
+      });
 
       // Console output with color coding
       if (config.consoleOutput !== false) {

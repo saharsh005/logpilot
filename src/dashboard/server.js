@@ -9,6 +9,42 @@ const { subscribeToHeals, getActiveCircuitBreakers, getActiveRateLimits } = requ
 const { getRouteBaselines } = require('../core/anomaly-detector');
 const vectorStore = require('../nlp/vector-store');
 const { captureSnapshot } = require('../heap/snapshot');
+const { buildIncidentContext } = require('../correlation/IncidentCorrelator');
+const { buildCorrelationGraph } = require('../correlation/correlator');
+const { analyzeRootCause } = require('../ai/RootCauseEngine');
+const { verifyRecovery } = require('../recovery/RecoveryVerifier');
+const { generatePostmortem } = require('../postmortem/PostmortemGenerator');
+const { findSimilarIncidents } = require('../similarity/incident-search');
+const { generateRecommendations } = require('../recovery/recommendations');
+const { investigate } = require('../agent/investigator');
+const { getService: getSplunkService } = require('../integrations/splunk/service');
+
+// ── Phase 12: simple in-memory rate limiter for API endpoints ─────────────
+const _apiRateCounts = new Map();
+function apiRateLimit(maxPerMinute = 60) {
+  return (req, res, next) => {
+    const key = req.ip + ':' + req.path;
+    const now = Date.now();
+    const entry = _apiRateCounts.get(key) || { count: 0, resetAt: now + 60000 };
+    if (now > entry.resetAt) { entry.count = 0; entry.resetAt = now + 60000; }
+    entry.count++;
+    _apiRateCounts.set(key, entry);
+    if (entry.count > maxPerMinute) {
+      return res.status(429).json({ error: 'Too many requests', retryAfter: Math.ceil((entry.resetAt - now) / 1000) });
+    }
+    next();
+  };
+}
+
+// ── Phase 12: input validation helper ────────────────────────────────────
+function validateIncidentId(req, res) {
+  const id = parseInt(req.params.id, 10);
+  if (!id || id < 1 || id > 1e9) {
+    res.status(400).json({ error: 'Invalid incident ID' });
+    return null;
+  }
+  return id;
+}
 
 let dashboardApp = null;
 let dashboardServer = null;
@@ -60,6 +96,11 @@ function startDashboard(port = 4321, config = {}) {
     res.json({ metrics: db.getRecentMetrics(minutes) });
   });
 
+  dashboardApp.get('/api/analytics', (req, res) => {
+    const hours = parseInt(req.query.hours) || 24;
+    res.json(db.getDashboardAnalytics({ since: Date.now() - hours * 60 * 60 * 1000 }));
+  });
+
   dashboardApp.get('/api/heals', (req, res) => {
     res.json({ actions: db.getHealActions(50) });
   });
@@ -85,6 +126,28 @@ function startDashboard(port = 4321, config = {}) {
     });
   });
 
+  dashboardApp.get('/api/incidents/:id/analysis', async (req, res) => {
+    try {
+      const analysis = await getIncidentAnalysis(parseInt(req.params.id), config);
+      if (!analysis) return res.status(404).json({ error: 'incident group not found' });
+      res.json(analysis);
+    } catch (err) {
+      res.status(500).json({ error: 'analysis failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/postmortem.md', async (req, res) => {
+    try {
+      const analysis = await getIncidentAnalysis(parseInt(req.params.id), config);
+      if (!analysis) return res.status(404).send('Incident group not found');
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="logpilot-incident-${req.params.id}-postmortem.md"`);
+      res.send(analysis.postmortem || '# Incident Summary\n\nNo postmortem generated.');
+    } catch (err) {
+      res.status(500).send(`Postmortem generation failed: ${err.message}`);
+    }
+  });
+
   dashboardApp.get('/api/incidents/:id/related', (req, res) => {
     const related = db.getRelatedIncidents(parseInt(req.params.id));
     res.json({ related });
@@ -103,11 +166,170 @@ function startDashboard(port = 4321, config = {}) {
     res.json({ snapshot: snap });
   });
 
+  // ── Phase 11: Splunk health endpoint ────────────────────────────────────
+  dashboardApp.get('/api/splunk/health', apiRateLimit(30), async (req, res) => {
+    const splunk = getSplunkService();
+    if (!splunk) return res.json({ enabled: false, reason: 'Splunk service not initialised' });
+    try {
+      const health = await splunk.getFullHealth();
+      res.json(health);
+    } catch (err) {
+      res.status(500).json({ error: 'Health check failed', message: err.message });
+    }
+  });
+
+  // Serve extended dashboard JS (Phase 3-7 render functions)
+  dashboardApp.get('/dashboard-ext.js', (req, res) => {
+    const fs = require('fs');
+    const path = require('path');
+    const extPath = path.join(__dirname, 'dashboard-ext.js');
+    res.setHeader('Content-Type', 'application/javascript');
+    try { res.send(fs.readFileSync(extPath, 'utf8')); }
+    catch(e) { res.status(404).send('// dashboard-ext.js not found'); }
+  });
+
   dashboardApp.get('/api/protections', (req, res) => {
     res.json({
       circuitBreakers: getActiveCircuitBreakers(),
       rateLimits: getActiveRateLimits(),
     });
+  });
+
+  // ── Phase 3: Correlation Graph ──────────────────────────────────────────
+  dashboardApp.get('/api/incidents/:id/correlation', apiRateLimit(30), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const context = await buildIncidentContext(id, config);
+      if (!context) return res.status(404).json({ error: 'incident not found' });
+      const graph = buildCorrelationGraph(context);
+      res.json(graph);
+    } catch (err) {
+      res.status(500).json({ error: 'correlation failed', message: err.message });
+    }
+  });
+
+  // ── Phase 4: Similar Incidents ──────────────────────────────────────────
+  dashboardApp.get('/api/incidents/:id/similar', apiRateLimit(30), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const incident = db.getIncidentGroup(id);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const similar = await findSimilarIncidents(incident, {
+        limit: parseInt(req.query.limit) || 10,
+        threshold: parseInt(req.query.threshold) || 25,
+      });
+      res.json({ similar });
+    } catch (err) {
+      res.status(500).json({ error: 'similarity search failed', message: err.message });
+    }
+  });
+
+  // ── Phase 5: AI Investigator (full agentic RCA) ─────────────────────────
+  dashboardApp.post('/api/incidents/:id/investigate', apiRateLimit(10), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const result = await investigate(id, config);
+      if (!result) return res.status(404).json({ error: 'incident not found' });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'investigation failed', message: err.message });
+    }
+  });
+
+  // ── Phase 7: Recovery Recommendations ───────────────────────────────────
+  dashboardApp.get('/api/incidents/:id/recommendations', apiRateLimit(30), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const context = await buildIncidentContext(id, config);
+      if (!context) return res.status(404).json({ error: 'incident not found' });
+      const incident = db.getIncidentGroup(parseInt(req.params.id));
+      const similar = await findSimilarIncidents(incident, { limit: 5 });
+      const recommendations = generateRecommendations(context, similar, config);
+      res.json({ recommendations });
+    } catch (err) {
+      res.status(500).json({ error: 'recommendations failed', message: err.message });
+    }
+  });
+
+  // ── Phase 2: Evidence snapshot ───────────────────────────────────────────
+  dashboardApp.get('/api/incidents/:id/evidence', apiRateLimit(30), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const snapshot = db.getEvidenceSnapshot(id);
+      if (snapshot) {
+        return res.json(JSON.parse(snapshot.evidence_json));
+      }
+      // Trigger collection if not cached
+      const { collectEvidence } = require('../investigator/evidence/collector');
+      const incident = db.getIncidentGroup(id);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const evidence = await collectEvidence(incident, config);
+      res.json(evidence);
+    } catch (err) {
+      res.status(500).json({ error: 'evidence collection failed', message: err.message });
+    }
+  });
+
+  // ── Phase 8: Recovery Verification ──────────────────────────────────────
+  dashboardApp.get('/api/incidents/:id/recovery', apiRateLimit(30), async (req, res) => {
+    try {
+      const id = validateIncidentId(req, res); if (!id) return;
+      const incident = db.getIncidentGroup(id);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const result = await verifyRecovery(incident, config);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'recovery verification failed', message: err.message });
+    }
+  });
+
+  // ── Phase 10: Analytics ──────────────────────────────────────────────────
+  dashboardApp.get('/api/analytics/advanced', (req, res) => {
+    const hours = parseInt(req.query.hours) || 24;
+    const since = Date.now() - hours * 60 * 60 * 1000;
+    try {
+      const incidents = db.getIncidentGroups({ limit: 500, since });
+      const heals = db.getHealActions(500);
+
+      // Root cause distribution
+      const rcaDist = {};
+      incidents.forEach(inc => {
+        const rc = inc.root_cause || 'Unknown';
+        rcaDist[rc] = (rcaDist[rc] || 0) + 1;
+      });
+
+      // Recovery success rate
+      const totalHeals = heals.length;
+      const successfulHeals = heals.filter(h => h.success).length;
+      const recoverySuccessRate = totalHeals ? Math.round((successfulHeals / totalHeals) * 100) : 0;
+
+      // Mean time to recovery (approx: last_seen - first_seen for resolved incidents)
+      const resolvedTimes = incidents
+        .filter(inc => inc.last_action)
+        .map(inc => (inc.last_seen - inc.first_seen) / 60000);  // minutes
+      const mttr = resolvedTimes.length
+        ? Math.round(resolvedTimes.reduce((a, b) => a + b, 0) / resolvedTimes.length)
+        : 0;
+
+      // Category distribution
+      const categories = {};
+      incidents.forEach(inc => {
+        const cat = mapRootCauseToCategory(inc.root_cause);
+        categories[cat] = (categories[cat] || 0) + 1;
+      });
+
+      res.json({
+        rcaDistribution: Object.entries(rcaDist).map(([label, value]) => ({ label, value })),
+        recoverySuccessRate,
+        mttrMinutes: mttr,
+        totalIncidents: incidents.length,
+        totalHeals,
+        successfulHeals,
+        incidentCategories: Object.entries(categories).map(([label, value]) => ({ label, value })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'analytics failed', message: err.message });
+    }
   });
 
   dashboardApp.get('/', (req, res) => {
@@ -146,6 +368,37 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   return dashboardServer;
+}
+
+function mapRootCauseToCategory(rootCause) {
+  if (!rootCause) return 'Unknown';
+  const rc = rootCause.toLowerCase();
+  if (rc.includes('memory') || rc.includes('cpu')) return 'Resource';
+  if (rc.includes('data') || rc.includes('timeout')) return 'Dependency';
+  if (rc.includes('rate')) return 'Traffic';
+  if (rc.includes('deploy') || rc.includes('code')) return 'Deployment';
+  return rootCause;
+}
+
+async function getIncidentAnalysis(incidentId, config) {
+  const incident = db.getIncidentGroup(incidentId);
+  if (!incident) return null;
+
+  const cached = db.getIncidentAnalysis(incidentId);
+  if (cached && Date.now() - cached.updatedAt < 60 * 1000) return cached;
+
+  const context = await buildIncidentContext(incidentId, config);
+  if (!context) return null;
+  const rca = await analyzeRootCause(context, config);
+  const recovery = verifyRecovery(incident, config);
+  const healActions = db.getHealActions(100).filter(action => {
+    const trigger = `${action.trigger_detail || ''} ${action.notes || ''}`;
+    return !incident.path || trigger.includes(incident.path) || trigger.includes(incident.title || '');
+  });
+  const postmortem = generatePostmortem({ incident, context, rca, recovery, healActions });
+  const analysis = { incidentId, context, rca, recovery, postmortem, updatedAt: Date.now() };
+  db.upsertIncidentAnalysis(incidentId, analysis);
+  return analysis;
 }
 
 function broadcast(msg) {
@@ -350,6 +603,19 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
 .legend-item { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text2); }
 .legend-dot { width:8px; height:8px; border-radius:2px; }
 #trend-canvas { width:100%; height:180px; display:block; }
+.mini-chart-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-bottom:16px; }
+.mini-chart { height:190px; padding:12px 14px; }
+.chart-canvas { width:100%; height:130px; display:block; }
+.analysis-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.analysis-box { background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:11px 12px; }
+.analysis-label { font-size:10px; font-weight:600; letter-spacing:0.07em; text-transform:uppercase; color:var(--text4); margin-bottom:5px; }
+.analysis-value { font-size:17px; font-weight:600; color:var(--text); }
+.evidence-list { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+.evidence-item { border:1px solid var(--border); border-radius:8px; padding:9px 10px; background:var(--surface); font-size:12px; color:var(--text2); }
+.postmortem-box { white-space:pre-wrap; font-family:'DM Mono',monospace; font-size:11px; line-height:1.55; background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:12px; max-height:260px; overflow:auto; color:var(--text2); }
+.tab-row { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:10px; }
+.tab-btn { border:1px solid var(--border); background:var(--surface); color:var(--text2); font:500 12px 'DM Sans',sans-serif; padding:6px 10px; border-radius:7px; cursor:pointer; }
+.tab-btn.active { background:var(--blue-light); border-color:var(--blue-mid); color:var(--blue); }
 
 /* ── SYSTEM EVENTS ───────────────────────────────────────────── */
 .event-list { padding:6px 0; max-height:300px; overflow-y:auto; }
@@ -674,6 +940,14 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
       <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M3 4a1 1 0 00-1 1v10a1 1 0 001 1h14a1 1 0 001-1V5a1 1 0 00-1-1H3zm5 6a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2z"/></svg>
       Heap Snapshots
     </div>
+    <div class="sb-item" id="nav-splunk" onclick="navigate('splunk')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      Splunk Health
+    </div>
+    <div class="sb-item" id="nav-analysis" onclick="navigate('analysis')">
+      <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zm6-7a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1H9a1 1 0 01-1-1V4zm6 4a1 1 0 011-1h2a1 1 0 011 1v8a1 1 0 01-1 1h-2a1 1 0 01-1-1V8z"/></svg>
+      RCA Reports
+    </div>
   </div>
 
   <div class="sb-footer">
@@ -790,6 +1064,21 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
         <div class="event-list" id="event-list">
           <div class="event-empty">No incidents yet</div>
         </div>
+      </div>
+    </div>
+
+    <div class="mini-chart-grid">
+      <div class="card mini-chart">
+        <div class="card-title">Status Mix</div>
+        <canvas id="status-chart" class="chart-canvas" height="120"></canvas>
+      </div>
+      <div class="card mini-chart">
+        <div class="card-title">Root Causes</div>
+        <canvas id="root-chart" class="chart-canvas" height="120"></canvas>
+      </div>
+      <div class="card mini-chart">
+        <div class="card-title">Recovery Signals</div>
+        <canvas id="metrics-chart" class="chart-canvas" height="120"></canvas>
       </div>
     </div>
 
@@ -924,6 +1213,54 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
       </div>
     </div>
   </div>
+
+  <!-- ANALYSIS PAGE -->
+  <div class="page" id="page-splunk">
+  <div class="page-header"><h1 class="page-title">Splunk Integration Health</h1></div>
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">HEC Status</div>
+      <div class="card-action" onclick="fetchSplunkHealth()">Refresh</div>
+    </div>
+    <div id="splunk-health-content"><div class="empty-state"><p>Loading Splunk health…</p></div></div>
+  </div>
+</div>
+
+<div class="page" id="page-analysis">
+    <h1 class="page-title">RCA Reports</h1>
+    <div class="mini-chart-grid">
+      <div class="card mini-chart">
+        <div class="card-title">Incident Root Causes</div>
+        <canvas id="analysis-root-chart" class="chart-canvas" height="120"></canvas>
+      </div>
+      <div class="card mini-chart">
+        <div class="card-title">Heal Actions</div>
+        <canvas id="heal-chart" class="chart-canvas" height="120"></canvas>
+      </div>
+      <div class="card mini-chart">
+        <div class="card-title">Status Classes</div>
+        <canvas id="analysis-status-chart" class="chart-canvas" height="120"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Latest AI Analysis</div>
+        <div class="card-action" onclick="fetchIncidents();fetchAnalytics()">Refresh</div>
+      </div>
+      <div id="analysis-list">
+        <div class="empty-state"><p>Open an incident to generate RCA details</p></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Advanced Analytics</div>
+        <div class="card-action" onclick="fetchAdvancedAnalytics()">Refresh</div>
+      </div>
+      <div id="advanced-analytics">
+        <div class="empty-state"><p>Loading analytics…</p></div>
+      </div>
+    </div>
+  </div>
 </div>
 </div>
 
@@ -947,6 +1284,9 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
       <div class="modal-ts" id="modal-ts">—</div>
       <div class="modal-actions">
         <button class="btn-outline" onclick="closeModal()">Dismiss</button>
+        <button class="btn-outline" onclick="runAIInvestigation()" id="btn-investigate" style="display:none">
+          🤖 AI Investigate
+        </button>
         <button class="btn-primary" onclick="viewFullReport()">
           View Full Report
           <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd"/></svg>
@@ -963,6 +1303,8 @@ let incidents = [];
 let heals = [];
 let logEntries = [];
 let snapshots = [];
+let analytics = {};
+let analyses = {};
 let activeModal = null;
 let logFilter = '';
 const MAX_LOGS = 500;
@@ -1000,9 +1342,10 @@ function setWs(on) {
 setInterval(fetchStats, 8000);
 setInterval(fetchIncidents, 10000);
 setInterval(fetchProtections, 12000);
-fetchStats(); fetchIncidents(); fetchHeals(); fetchProtections(); fetchSnaps();
+setInterval(fetchAnalytics, 15000);
+fetchStats(); fetchIncidents(); fetchHeals(); fetchProtections(); fetchSnaps(); fetchAnalytics();
 
-function refreshAll() { fetchStats(); fetchIncidents(); fetchHeals(); fetchProtections(); fetchSnaps(); }
+function refreshAll() { fetchStats(); fetchIncidents(); fetchHeals(); fetchProtections(); fetchSnaps(); fetchAnalytics(); }
 
 function fetchStats() {
   fetch('/api/stats').then(r=>r.json()).then(applyStats).catch(()=>{});
@@ -1042,6 +1385,13 @@ function fetchSnaps() {
   fetch('/api/heap-snapshots').then(r=>r.json()).then(d => {
     snapshots = d.snapshots || [];
     renderSnaps();
+  }).catch(()=>{});
+}
+function fetchAnalytics() {
+  fetch('/api/analytics').then(r=>r.json()).then(d => {
+    analytics = d || {};
+    renderAnalyticsCharts();
+    renderAnalysisList();
   }).catch(()=>{});
 }
 
@@ -1182,6 +1532,89 @@ function drawChart() {
   }
 }
 
+function renderAnalyticsCharts() {
+  drawBars('status-chart', analytics.statusClasses || [], ['#16a34a','#d97706','#dc2626','#8a94a6']);
+  drawBars('analysis-status-chart', analytics.statusClasses || [], ['#16a34a','#d97706','#dc2626','#8a94a6']);
+  drawBars('root-chart', analytics.rootCauses || [], ['#2563eb','#7c3aed','#ea580c','#dc2626','#16a34a']);
+  drawBars('analysis-root-chart', analytics.rootCauses || [], ['#2563eb','#7c3aed','#ea580c','#dc2626','#16a34a']);
+  drawBars('heal-chart', analytics.healActions || [], ['#7c3aed','#16a34a','#d97706','#2563eb','#dc2626']);
+  drawMetricLines('metrics-chart', analytics.metricSeries || []);
+}
+
+function drawBars(id, rows, colors) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const ctx = prepCanvas(canvas);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  const data = rows.length ? rows : [{ label: 'No data', value: 0 }];
+  const max = Math.max(...data.map(r => Number(r.value || 0)), 1);
+  const pad = { top: 10, right: 8, bottom: 28, left: 26 };
+  const bw = (w - pad.left - pad.right) / data.length - 8;
+  data.forEach((row, i) => {
+    const value = Number(row.value || 0);
+    const bh = Math.max(2, ((h - pad.top - pad.bottom) * value) / max);
+    const x = pad.left + i * (bw + 8);
+    const y = h - pad.bottom - bh;
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fillRect(x, y, Math.max(8, bw), bh);
+    ctx.fillStyle = '#4a5568';
+    ctx.font = '10px DM Mono, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(String(value), x + bw / 2, y - 4);
+    ctx.fillStyle = '#8a94a6';
+    ctx.font = '10px DM Sans, sans-serif';
+    ctx.fillText(String(row.label || '').slice(0, 10), x + bw / 2, h - 8);
+  });
+}
+
+function drawMetricLines(id, rows) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const ctx = prepCanvas(canvas);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  if (!rows.length) {
+    ctx.fillStyle = '#8a94a6';
+    ctx.font = '12px DM Sans, sans-serif';
+    ctx.fillText('No metrics yet', 12, 24);
+    return;
+  }
+  const pad = { top: 12, right: 10, bottom: 22, left: 28 };
+  const n = rows.length;
+  const xAt = i => pad.left + ((w - pad.left - pad.right) * i / Math.max(1, n - 1));
+  const yAt = v => pad.top + (h - pad.top - pad.bottom) - (Math.min(100, v) / 100) * (h - pad.top - pad.bottom);
+  drawMetricPath(ctx, rows.map(r => Number(r.memory_percent || 0)), xAt, yAt, '#16a34a');
+  drawMetricPath(ctx, rows.map(r => Number(r.cpu_percent || 0)), xAt, yAt, '#2563eb');
+  ctx.fillStyle = '#8a94a6';
+  ctx.font = '10px DM Sans, sans-serif';
+  ctx.fillText('Memory', pad.left, h - 6);
+  ctx.fillStyle = '#2563eb';
+  ctx.fillText('CPU', pad.left + 58, h - 6);
+}
+
+function drawMetricPath(ctx, values, xAt, yAt, color) {
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    if (i === 0) ctx.moveTo(xAt(i), yAt(v));
+    else ctx.lineTo(xAt(i), yAt(v));
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function prepCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 240;
+  const h = canvas.clientHeight || 120;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
 // ── EVENT LIST (dashboard sidebar) ─────────────────────────
 function renderEventList() {
   const el = document.getElementById('event-list');
@@ -1254,6 +1687,9 @@ function openIncidentModal(id) {
   document.getElementById('detail-overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
 
+  const investigateBtn = document.getElementById('btn-investigate');
+  if (investigateBtn) investigateBtn.style.display = '';
+
   fetch('/api/incidents/' + id + '/timeline').then(r => r.json()).then(data => {
     renderModalBody(data.group || {}, data.events || [], data.related || []);
   }).catch(() => {
@@ -1273,6 +1709,17 @@ function renderModalBody(group, events, related) {
   const rcDesc = getRCDesc(group.root_cause);
   const body = document.getElementById('modal-body');
   body.innerHTML = \`
+    <div class="tab-row">
+      <button class="tab-btn active" onclick="showIncidentTab('overview', this)">Overview</button>
+      <button class="tab-btn" onclick="showIncidentTab('evidence', this)">Evidence</button>
+      <button class="tab-btn" onclick="showIncidentTab('correlation', this)">Correlation</button>
+      <button class="tab-btn" onclick="showIncidentTab('similar', this)">Similar</button>
+      <button class="tab-btn" onclick="showIncidentTab('rca', this)">AI RCA</button>
+      <button class="tab-btn" onclick="showIncidentTab('recommendations', this)">Actions</button>
+      <button class="tab-btn" onclick="showIncidentTab('recovery', this)">Recovery</button>
+      <button class="tab-btn" onclick="showIncidentTab('postmortem', this)">Postmortem</button>
+    </div>
+    <div class="tab-pane active" id="tab-overview">
     <div class="detail-stat-row">
       <div class="detail-stat">
         <div class="detail-stat-label">Status</div>
@@ -1331,10 +1778,69 @@ function renderModalBody(group, events, related) {
       \`).join('')}
       \${events.length > 12 ? \`<div style="padding:6px 0 2px 24px;font-size:11px;color:var(--text4)">\${events.length - 12} more events…</div>\` : ''}
     </div>
+    </div>
+    <div class="tab-pane" id="tab-evidence"><div class="empty-state"><p>Loading evidence...</p></div></div>
+    <div class="tab-pane" id="tab-correlation"><div class="empty-state"><p>Building correlation graph...</p></div></div>
+    <div class="tab-pane" id="tab-similar"><div class="empty-state"><p>Searching for similar incidents...</p></div></div>
+    <div class="tab-pane" id="tab-rca"><div class="empty-state"><p>Running AI investigation...</p></div></div>
+    <div class="tab-pane" id="tab-recommendations"><div class="empty-state"><p>Generating recommendations...</p></div></div>
+    <div class="tab-pane" id="tab-recovery"><div class="empty-state"><p>Checking recovery status...</p></div></div>
+    <div class="tab-pane" id="tab-postmortem"><div class="empty-state"><p>Preparing postmortem...</p></div></div>
   \`;
+  fetchIncidentAnalysis(group.id);
 }
 
 // ── LIVE LOGS ────────────────────────────────────────────────
+function showIncidentTab(name, btn) {
+  document.querySelectorAll('#modal-body .tab-btn').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('#modal-body .tab-pane').forEach(el => el.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const pane = document.getElementById('tab-' + name);
+  if (pane) pane.classList.add('active');
+}
+
+function fetchIncidentAnalysis(id) {
+  // Fire all data fetches in parallel
+  const analysisP = fetch('/api/incidents/' + id + '/analysis').then(r => r.json()).catch(() => null);
+  const correlationP = fetch('/api/incidents/' + id + '/correlation').then(r => r.json()).catch(() => null);
+  const similarP = fetch('/api/incidents/' + id + '/similar').then(r => r.json()).catch(() => null);
+  const recsP = fetch('/api/incidents/' + id + '/recommendations').then(r => r.json()).catch(() => null);
+  const recoveryP = fetch('/api/incidents/' + id + '/recovery').then(r => r.json()).catch(() => null);
+  const evidenceP = fetch('/api/incidents/' + id + '/evidence').then(r => r.json()).catch(() => null);
+
+  analysisP.then(data => {
+    if (data) { analyses[id] = data; renderIncidentAnalysis(data); renderAnalysisList(); }
+  });
+  correlationP.then(graph => { if (graph) renderCorrelationTab(graph); });
+  similarP.then(data => { if (data) renderSimilarTab(data.similar || []); });
+  recsP.then(data => { if (data) renderRecommendationsTab(data.recommendations || []); });
+  recoveryP.then(data => { if (data) renderRecoveryTab(data); });
+  evidenceP.then(data => { if (data) renderEvidenceTab(data); });
+}
+
+
+function renderAnalysisList() {
+  const el = document.getElementById('analysis-list');
+  if (!el) return;
+  const rows = Object.values(analyses).filter(a => a && a.rca);
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty-state"><p>Open an incident to generate RCA details</p></div>';
+    return;
+  }
+  el.innerHTML = rows.map(a => {
+    const inc = a.context?.incident || {};
+    return \`
+      <div class="event-item" onclick="openIncidentModal(\${inc.id})">
+        <div class="event-dot \${inc.severity === 'critical' ? 'critical' : 'warning'}"></div>
+        <div class="event-body">
+          <div class="event-title">\${esc(inc.title || 'Incident analysis')}</div>
+          <div class="event-sub">\${esc(a.rca.rootCause || '')} - \${a.rca.confidence || 0}% confidence - \${a.recovery?.resolved ? 'resolved' : 'open'}</div>
+        </div>
+      </div>
+    \`;
+  }).join('');
+}
+
 let logFilterLevel = '';
 function onLog(entry) {
   logEntries.unshift(entry);
@@ -1540,6 +2046,8 @@ function navigate(page) {
   if (page === 'incidents') fetchIncidents();
   if (page === 'heals') { fetchHeals(); fetchProtections(); }
   if (page === 'memory') fetchSnaps();
+  if (page === 'splunk')   { fetchSplunkHealth(); }
+  if (page === 'analysis') { fetchAnalytics(); renderAnalysisList(); fetchAdvancedAnalytics(); }
 }
 
 // ── HELPERS ─────────────────────────────────────────────────
@@ -1584,7 +2092,7 @@ function getRCDesc(cause) {
 }
 
 // ── INIT ─────────────────────────────────────────────────────
-window.addEventListener('resize', drawChart);
+window.addEventListener('resize', () => { drawChart(); renderAnalyticsCharts(); });
 window.addEventListener('load', () => {
   initChart();
   // Set date range label
@@ -1602,6 +2110,7 @@ window.addEventListener('load', () => {
   });
 });
 </script>
+<script src="/dashboard-ext.js"></script>
 </body>
 </html>`;
 }
