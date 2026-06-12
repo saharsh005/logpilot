@@ -148,11 +148,6 @@ logpilot.init({
   ]
 });
 
-const { getService } = require('../src/integrations/splunk/service');
-
-setTimeout(() => {
-  console.log("SPLUNK SERVICE:", getService()?.getHealth());
-}, 5000);
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 

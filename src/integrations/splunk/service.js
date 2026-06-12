@@ -27,7 +27,7 @@ class SplunkService {
 
     if (this.enabled && this.splunkConfig.token) {
       this.hec = new HECClient({
-        hecUrl:             this.splunkConfig.hecUrl || `http://${this.splunkConfig.host}:8088`,
+        hecUrl:             this.splunkConfig.hecUrl || `https://${this.splunkConfig.host}:8088`,
         hecToken:           this.splunkConfig.hecToken || this.splunkConfig.token,
         index:              this.splunkConfig.index   || 'logpilot',
         batchSize:          config.batchSize          || 100,

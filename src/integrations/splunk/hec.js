@@ -33,7 +33,7 @@ const SOURCETYPE_MAP = {
 
 class HECClient {
   constructor(config = {}) {
-    this.hecUrl           = config.hecUrl  || 'http://localhost:8088';
+    this.hecUrl           = config.hecUrl  || 'https://localhost:8088';
     this.hecToken         = config.hecToken || '';
     this.batchSize        = config.batchSize       || 100;
     this.flushInterval    = config.flushInterval   || 5000;

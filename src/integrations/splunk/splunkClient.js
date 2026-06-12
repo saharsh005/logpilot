@@ -1,4 +1,7 @@
+require('dotenv').config();
+
 const fetch = require('node-fetch');
+
 
 let sessionKey = null;
 let sessionExpiresAt = 0;
@@ -46,17 +49,35 @@ async function getSplunkClient(config = {}) {
     output_mode: 'json',
   });
 
-  const res = await fetch(`${getBaseUrl(splunkConfig)}/services/auth/login`, {
-    method: 'POST',
-    body,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  const https = require('https');
+
+  const agent = new https.Agent({
+  rejectUnauthorized: false
   });
+
+  const res = await fetch(
+    `${getBaseUrl(splunkConfig)}/services/auth/login?output_mode=json`,
+    {
+      method: 'POST',
+      body,
+      agent,
+      headers: {
+        'Content-Type':'application/x-www-form-urlencoded'
+      }
+    }
+  );
+
+  const responseText = await res.text();
+
+  console.log("Splunk Login Status:", res.status);
+  console.log("Splunk Login Response:", responseText);
 
   if (!res.ok) {
     throw new Error(`Splunk login failed (${res.status})`);
   }
 
-  const data = await res.json();
+  const data = JSON.parse(responseText);
+
   sessionKey = data.sessionKey;
   sessionExpiresAt = Date.now() + 45 * 60 * 1000;
   return { enabled: true, authHeader: `Splunk ${sessionKey}`, config: splunkConfig };

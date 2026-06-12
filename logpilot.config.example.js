@@ -20,7 +20,7 @@ module.exports = {
     enabled:            process.env.SPLUNK_ENABLED === 'true' || false,
 
     // HTTP Event Collector (HEC) — for sending events TO Splunk
-    hecUrl:             process.env.SPLUNK_HEC_URL   || 'http://localhost:8088',
+    hecUrl:             process.env.SPLUNK_HEC_URL   || 'https://localhost:8088',
     token:              process.env.SPLUNK_HEC_TOKEN || '',   // HEC token
     index:              process.env.SPLUNK_INDEX     || 'logpilot',
 
