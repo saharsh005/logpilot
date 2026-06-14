@@ -55,7 +55,7 @@ const TOOLS = {
       path ? `path="${path}"` : '',
       rootCause ? `rootCause="${rootCause}"` : '',
     ].filter(Boolean).join(' ');
-    const spl = `search index=${index} type=incident ${filters} earliest=${earliest} | stats count by incidentId path rootCause`;
+    const spl = `search index=${index} type=incident ${filters} earliest=${earliest} | stats latest(title) as title latest(severity) as severity latest(lastSeen) as lastSeen sum(count) as count by incidentId path rootCause | sort -lastSeen`;
     const result = await searchSplunk(spl, config);
     return {
       tool: 'find_related_incidents',
@@ -115,6 +115,122 @@ const TOOLS = {
     const heals = db.getHealActions(50);
     return { tool: 'get_heal_history', source: 'local', heals };
   },
+
+  /**
+   * simulate_recovery: Estimate the effect and risk of a recovery action before execution.
+   */
+  async simulate_recovery({ incidentId, path, action, rootCause }, config) {
+    const incident = incidentId ? db.getIncidentGroup(Number(incidentId)) : { path, root_cause: rootCause };
+    const { scoreRecoveryConfidence } = require('../commander/recoveryConfidence');
+    const confidence = await scoreRecoveryConfidence(incident || { path, root_cause: rootCause }, action, config);
+    const risk = /restart|rollback/i.test(action) ? 'medium' : /notify/i.test(action) ? 'low' : 'low-medium';
+    return {
+      tool: 'simulate_recovery',
+      source: confidence.evidence?.source || 'local',
+      action,
+      risk,
+      expectedOutcome: confidence.successRate >= 80 ? 'likely_recovery' : confidence.successRate >= 60 ? 'partial_recovery_possible' : 'operator_review_required',
+      confidence,
+    };
+  },
+
+  /**
+   * estimate_blast_radius: Estimate affected services/endpoints/users from Splunk evidence.
+   */
+  async estimate_blast_radius({ path, service, earliest = '-1h' }, config) {
+    const index = config.splunk?.index || 'logpilot';
+    if (config.splunk?.enabled) {
+      const filters = [path ? `path="${path}"` : '', service ? `service="${service}"` : ''].filter(Boolean).join(' ');
+      const spl = `search index=${index} ${filters} earliest=${earliest} (statusCode>=500 OR level=error OR type=incident) | stats dc(path) as paths dc(service) as services count as events values(path) as affectedPaths values(service) as affectedServices`;
+      const result = await searchSplunk(spl, config);
+      const row = result.events?.[0] || {};
+      return {
+        tool: 'estimate_blast_radius',
+        source: result.source,
+        events: Number(row.events || 0),
+        affectedPathCount: Number(row.paths || 0),
+        affectedServiceCount: Number(row.services || 0),
+        affectedPaths: splitValues(row.affectedPaths),
+        affectedServices: splitValues(row.affectedServices),
+      };
+    }
+    const logs = db.queryLogs({ path, since: Date.now() - 60 * 60 * 1000, limit: 500 });
+    return {
+      tool: 'estimate_blast_radius',
+      source: 'local',
+      events: logs.length,
+      affectedPathCount: new Set(logs.map(l => l.path).filter(Boolean)).size,
+      affectedServiceCount: new Set(logs.map(l => l.service).filter(Boolean)).size,
+      affectedPaths: [...new Set(logs.map(l => l.path).filter(Boolean))],
+      affectedServices: [...new Set(logs.map(l => l.service).filter(Boolean))],
+    };
+  },
+
+  /**
+   * predict_incident_growth: Project event growth from the recent error slope.
+   */
+  async predict_incident_growth({ path, earliest = '-30m' }, config) {
+    const index = config.splunk?.index || 'logpilot';
+    if (config.splunk?.enabled) {
+      const pathFilter = path ? ` path="${path}"` : '';
+      const spl = `search index=${index}${pathFilter} earliest=${earliest} (statusCode>=500 OR level=error) | timechart span=5m count as errors`;
+      const result = await searchSplunk(spl, config);
+      return growthResult(result.events || [], 'errors', result.source);
+    }
+    const logs = db.queryLogs({ path, since: Date.now() - 30 * 60 * 1000, limit: 500 });
+    const buckets = {};
+    logs.forEach(log => {
+      const b = Math.floor(log.timestamp / 300000) * 300000;
+      buckets[b] = (buckets[b] || 0) + ((log.level === 'error' || log.status_code >= 500) ? 1 : 0);
+    });
+    return growthResult(Object.entries(buckets).map(([time, errors]) => ({ _time: Number(time), errors })), 'errors', 'local');
+  },
+
+  /**
+   * estimate_mttr: Estimate recovery time from similar incidents and heal history.
+   */
+  async estimate_mttr({ path, rootCause, earliest = '-30d' }, config) {
+    const related = await TOOLS.find_related_incidents({ path, rootCause, earliest }, config);
+    const heals = await TOOLS.get_heal_history({ path, earliest }, config);
+    const durations = (heals.heals || []).map(h => Number(h.mttrMinutes || h.durationMinutes || 0)).filter(Boolean);
+    const mttr = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : Math.max(4, Math.min(45, (related.incidents?.length || 1) * 4));
+    return {
+      tool: 'estimate_mttr',
+      source: heals.source || related.source,
+      meanMinutes: mttr,
+      basis: {
+        relatedIncidents: related.incidents?.length || related.count || 0,
+        healSamples: heals.heals?.length || 0,
+      },
+    };
+  },
+
+  /**
+   * explain_failure_pattern: Convert evidence into a judge-friendly causal narrative.
+   */
+  async explain_failure_pattern({ path, rootCause, earliest = '-1h' }, config) {
+    const [logs, deployments, metrics, heals] = await Promise.all([
+      TOOLS.search_logs({ query: path ? `path="${path}" (error OR statusCode>=500)` : '(error OR statusCode>=500)', earliest, limit: 25 }, config),
+      TOOLS.find_deployments({ path, earliest: '-6h' }, config),
+      TOOLS.get_metric_history({ metric: rootCause && /memory/i.test(rootCause) ? 'memory' : 'responseTime', path, earliest }, config),
+      TOOLS.get_heal_history({ path, earliest: '-30d' }, config),
+    ]);
+    const pattern = [
+      deployments.deployments?.length ? 'deployment-proximate' : null,
+      logs.events?.length ? 'error-burst' : null,
+      metrics.series?.length ? 'metric-shift' : null,
+      heals.heals?.length ? 'known-recovery-history' : null,
+    ].filter(Boolean);
+    return {
+      tool: 'explain_failure_pattern',
+      source: logs.source || 'local',
+      pattern,
+      explanation: pattern.length
+        ? `Failure pattern combines ${pattern.join(', ')} for ${path || 'the service'}.`
+        : `Insufficient evidence to classify the failure pattern for ${path || 'the service'}.`,
+      evidence: { logs: logs.count, deployments: deployments.count, metricBuckets: metrics.series?.length || 0, heals: heals.heals?.length || 0 },
+    };
+  },
 };
 
 /**
@@ -152,6 +268,31 @@ function getToolDefinitions() {
       description: 'Retrieve past heal/remediation actions for an endpoint.',
       params: { path: 'string?', earliest: 'string?' },
     },
+    {
+      name: 'simulate_recovery',
+      description: 'Simulate a proposed recovery action and estimate success, risk, and expected outcome.',
+      params: { incidentId: 'string?', path: 'string?', action: 'string', rootCause: 'string?' },
+    },
+    {
+      name: 'estimate_blast_radius',
+      description: 'Estimate affected paths, services, and event volume for an incident.',
+      params: { path: 'string?', service: 'string?', earliest: 'string?' },
+    },
+    {
+      name: 'predict_incident_growth',
+      description: 'Predict whether the current incident is accelerating based on recent error slope.',
+      params: { path: 'string?', earliest: 'string?' },
+    },
+    {
+      name: 'estimate_mttr',
+      description: 'Estimate mean time to recovery from similar incidents and heal history.',
+      params: { path: 'string?', rootCause: 'string?', earliest: 'string?' },
+    },
+    {
+      name: 'explain_failure_pattern',
+      description: 'Explain the observed failure pattern from logs, deployments, metrics, and heal history.',
+      params: { path: 'string?', rootCause: 'string?', earliest: 'string?' },
+    },
   ];
 }
 
@@ -165,3 +306,26 @@ async function executeTool(toolName, params, config) {
 }
 
 module.exports = { TOOLS, getToolDefinitions, executeTool };
+
+function splitValues(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  return String(value).split(/\s+/).filter(Boolean);
+}
+
+function growthResult(rows, field, source) {
+  const values = rows.map(row => Number(row[field] || 0));
+  const first = values.slice(0, Math.ceil(values.length / 2)).reduce((a, b) => a + b, 0);
+  const second = values.slice(Math.floor(values.length / 2)).reduce((a, b) => a + b, 0);
+  const slope = second - first;
+  return {
+    tool: 'predict_incident_growth',
+    source,
+    currentWindowEvents: second,
+    previousWindowEvents: first,
+    slope,
+    growth: slope > 10 ? 'accelerating' : slope > 0 ? 'growing' : 'stable_or_declining',
+    projectedNext30m: Math.max(0, Math.round(second + slope * 2)),
+    series: rows,
+  };
+}

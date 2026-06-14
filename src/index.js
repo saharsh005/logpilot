@@ -20,6 +20,7 @@ const { cleanup }         = require('./storage/db');
 const { initEmbedder }    = require('./nlp/embedder');
 const vectorStore         = require('./nlp/vector-store');
 const { initSplunkService } = require('./integrations/splunk/service');
+const { commandIncident, listCommandableIncidents, getPredictiveSearches } = require('./commander/incidentCommander');
 
 let _config = {};
 let _initialized = false;
@@ -188,6 +189,18 @@ function status() {
   };
 }
 
+function incidents(options = {}) {
+  return listCommandableIncidents(_config, options);
+}
+
+function command(incidentId, options = {}) {
+  return commandIncident(incidentId, _config, options);
+}
+
+function predictions() {
+  return getPredictiveSearches(_config);
+}
+
 // ── Phase 12: Graceful shutdown ──────────────────────────────────────────
 
 async function shutdown(signal = 'SIGTERM') {
@@ -227,4 +240,4 @@ function _registerShutdownHandlers() {
   process.once('SIGINT',  handle('SIGINT'));
 }
 
-module.exports = { init, log, query, metrics, status, shutdown };
+module.exports = { init, log, query, metrics, status, incidents, command, predictions, shutdown };

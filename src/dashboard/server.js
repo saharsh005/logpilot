@@ -18,6 +18,12 @@ const { findSimilarIncidents } = require('../similarity/incident-search');
 const { generateRecommendations } = require('../recovery/recommendations');
 const { investigate } = require('../agent/investigator');
 const { getService: getSplunkService } = require('../integrations/splunk/service');
+const splunkDatastore = require('../integrations/splunk/datastore');
+const { commandIncident, listCommandableIncidents, getPredictiveSearches } = require('../commander/incidentCommander');
+const { buildKnowledgeGraph, dashboardVisualizationSpec } = require('../commander/knowledgeGraph');
+const { collectEvidence } = require('../investigator/evidence/collector');
+const { executeTool } = require('../mcp/tools');
+const { searchSplunk } = require('../integrations/splunk/splunkSearch');
 
 // ── Phase 12: simple in-memory rate limiter for API endpoints ─────────────
 const _apiRateCounts = new Map();
@@ -44,6 +50,15 @@ function validateIncidentId(req, res) {
     return null;
   }
   return id;
+}
+
+// Allows numeric SQLite ids (1, 42) AND Splunk-sourced ids (splunk-1, splunk-12)
+function validateIncidentParam(req, res, next) {
+  const id = String(req.params.id || '');
+  if (!/^(splunk-)?\d{1,10}$/.test(id)) {
+    return res.status(400).json({ error: 'Invalid incident ID' });
+  }
+  next();
 }
 
 let dashboardApp = null;
@@ -105,30 +120,42 @@ function startDashboard(port = 4321, config = {}) {
     res.json({ actions: db.getHealActions(50) });
   });
 
-  dashboardApp.get('/api/incidents', (req, res) => {
+  dashboardApp.get('/api/incidents', async (req, res) => {
     const hours = parseInt(req.query.hours) || 24;
-    res.json({
-      groups: db.getIncidentGroups({
-        limit: parseInt(req.query.limit) || 100,
-        since: Date.now() - hours * 60 * 60 * 1000,
-      }),
-    });
-  });
-
-  dashboardApp.get('/api/incidents/:id/timeline', (req, res) => {
-    const group = db.getIncidentGroup(parseInt(req.params.id));
-    if (!group) return res.status(404).json({ error: 'incident group not found' });
-    const related = db.getRelatedIncidents(group.id);
-    res.json({
-      group,
-      events: db.getIncidentTimeline(group.id, parseInt(req.query.limit) || 100),
-      related,
-    });
-  });
-
-  dashboardApp.get('/api/incidents/:id/analysis', async (req, res) => {
     try {
-      const analysis = await getIncidentAnalysis(parseInt(req.params.id), config);
+      const result = await splunkDatastore.getIncidents(config, {
+        hours,
+        limit: parseInt(req.query.limit) || 100,
+      });
+      res.json({ groups: result.incidents, source: result.source, query: result.query });
+    } catch (err) {
+      // Always fall back to local so the dashboard never breaks
+      res.json({
+        groups: db.getIncidentGroups({
+          limit: parseInt(req.query.limit) || 100,
+          since: Date.now() - hours * 60 * 60 * 1000,
+        }),
+        source: 'local',
+        error: err.message,
+      });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/timeline', validateIncidentParam, async (req, res) => {
+    try {
+      const group = await splunkDatastore.getIncidentById(req.params.id, config);
+      if (!group) return res.status(404).json({ error: 'incident group not found' });
+      const related = Number.isFinite(group.id) ? db.getRelatedIncidents(group.id) : [];
+      const eventsResult = await splunkDatastore.getIncidentEvents(group, config, { limit: parseInt(req.query.limit) || 100 });
+      res.json({ group, events: eventsResult.events || [], related, source: eventsResult.source });
+    } catch (err) {
+      res.status(500).json({ error: 'timeline failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/analysis', validateIncidentParam, async (req, res) => {
+    try {
+      const analysis = await getIncidentAnalysis(req.params.id, config);
       if (!analysis) return res.status(404).json({ error: 'incident group not found' });
       res.json(analysis);
     } catch (err) {
@@ -136,9 +163,9 @@ function startDashboard(port = 4321, config = {}) {
     }
   });
 
-  dashboardApp.get('/api/incidents/:id/postmortem.md', async (req, res) => {
+  dashboardApp.get('/api/incidents/:id/postmortem.md', validateIncidentParam, async (req, res) => {
     try {
-      const analysis = await getIncidentAnalysis(parseInt(req.params.id), config);
+      const analysis = await getIncidentAnalysis(req.params.id, config);
       if (!analysis) return res.status(404).send('Incident group not found');
       res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="logpilot-incident-${req.params.id}-postmortem.md"`);
@@ -149,7 +176,8 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   dashboardApp.get('/api/incidents/:id/related', (req, res) => {
-    const related = db.getRelatedIncidents(parseInt(req.params.id));
+    const numId = Number(req.params.id);
+    const related = Number.isFinite(numId) ? db.getRelatedIncidents(numId) : [];
     res.json({ related });
   });
 
@@ -196,12 +224,11 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Phase 3: Correlation Graph ──────────────────────────────────────────
-  dashboardApp.get('/api/incidents/:id/correlation', apiRateLimit(30), async (req, res) => {
+  dashboardApp.get('/api/incidents/:id/correlation', apiRateLimit(30), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const context = await buildIncidentContext(id, config);
+      const context = await buildIncidentContext(req.params.id, config);
       if (!context) return res.status(404).json({ error: 'incident not found' });
-      const graph = buildCorrelationGraph(context);
+      const graph = await buildCorrelationGraph(context, config);
       res.json(graph);
     } catch (err) {
       res.status(500).json({ error: 'correlation failed', message: err.message });
@@ -209,14 +236,14 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Phase 4: Similar Incidents ──────────────────────────────────────────
-  dashboardApp.get('/api/incidents/:id/similar', apiRateLimit(30), async (req, res) => {
+  dashboardApp.get('/api/incidents/:id/similar', apiRateLimit(30), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const incident = db.getIncidentGroup(id);
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
       if (!incident) return res.status(404).json({ error: 'incident not found' });
       const similar = await findSimilarIncidents(incident, {
         limit: parseInt(req.query.limit) || 10,
         threshold: parseInt(req.query.threshold) || 25,
+        config,
       });
       res.json({ similar });
     } catch (err) {
@@ -225,10 +252,9 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Phase 5: AI Investigator (full agentic RCA) ─────────────────────────
-  dashboardApp.post('/api/incidents/:id/investigate', apiRateLimit(10), async (req, res) => {
+  dashboardApp.post('/api/incidents/:id/investigate', apiRateLimit(10), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const result = await investigate(id, config);
+      const result = await investigate(req.params.id, config);
       if (!result) return res.status(404).json({ error: 'incident not found' });
       res.json(result);
     } catch (err) {
@@ -237,13 +263,11 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Phase 7: Recovery Recommendations ───────────────────────────────────
-  dashboardApp.get('/api/incidents/:id/recommendations', apiRateLimit(30), async (req, res) => {
+  dashboardApp.get('/api/incidents/:id/recommendations', apiRateLimit(30), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const context = await buildIncidentContext(id, config);
+      const context = await buildIncidentContext(req.params.id, config);
       if (!context) return res.status(404).json({ error: 'incident not found' });
-      const incident = db.getIncidentGroup(parseInt(req.params.id));
-      const similar = await findSimilarIncidents(incident, { limit: 5 });
+      const similar = await findSimilarIncidents(context.incident, { limit: 5, config });
       const recommendations = generateRecommendations(context, similar, config);
       res.json({ recommendations });
     } catch (err) {
@@ -251,18 +275,12 @@ function startDashboard(port = 4321, config = {}) {
     }
   });
 
-  // ── Phase 2: Evidence snapshot ───────────────────────────────────────────
-  dashboardApp.get('/api/incidents/:id/evidence', apiRateLimit(30), async (req, res) => {
+  // ── Phase 2: Evidence snapshot (always collect fresh, cache for 2min) ────
+  dashboardApp.get('/api/incidents/:id/evidence', apiRateLimit(30), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const snapshot = db.getEvidenceSnapshot(id);
-      if (snapshot) {
-        return res.json(JSON.parse(snapshot.evidence_json));
-      }
-      // Trigger collection if not cached
-      const { collectEvidence } = require('../investigator/evidence/collector');
-      const incident = db.getIncidentGroup(id);
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
       if (!incident) return res.status(404).json({ error: 'incident not found' });
+      // collectEvidence handles its own cache check internally
       const evidence = await collectEvidence(incident, config);
       res.json(evidence);
     } catch (err) {
@@ -271,10 +289,9 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Phase 8: Recovery Verification ──────────────────────────────────────
-  dashboardApp.get('/api/incidents/:id/recovery', apiRateLimit(30), async (req, res) => {
+  dashboardApp.get('/api/incidents/:id/recovery', apiRateLimit(30), validateIncidentParam, async (req, res) => {
     try {
-      const id = validateIncidentId(req, res); if (!id) return;
-      const incident = db.getIncidentGroup(id);
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
       if (!incident) return res.status(404).json({ error: 'incident not found' });
       const result = await verifyRecovery(incident, config);
       res.json(result);
@@ -283,13 +300,131 @@ function startDashboard(port = 4321, config = {}) {
     }
   });
 
-  // ── Phase 10: Analytics ──────────────────────────────────────────────────
-  dashboardApp.get('/api/analytics/advanced', (req, res) => {
+  // ── Incident Commander: Splunk-first autonomous pipeline ────────────────
+  dashboardApp.get('/api/commander/predictions', apiRateLimit(20), (req, res) => {
+    try {
+      res.json({ queries: getPredictiveSearches(config), splunkEnabled: !!getSplunkService()?.isEnabled() });
+    } catch (err) {
+      res.status(500).json({ error: 'predictions failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/commander/predictions/run', apiRateLimit(10), async (req, res) => {
+    try {
+      const queries = getPredictiveSearches(config);
+      const name = req.query.name;
+      if (!name || !queries[name]) return res.status(400).json({ error: 'unknown prediction', available: Object.keys(queries) });
+      const result = await splunkDatastore.searchEvidence(queries[name], config);
+      res.json({ name, ...result });
+    } catch (err) {
+      res.status(500).json({ error: 'prediction run failed', message: err.message });
+    }
+  });
+
+  dashboardApp.post('/api/commander/run/:id', apiRateLimit(5), validateIncidentParam, async (req, res) => {
+    try {
+      const command = await commandIncident(req.params.id, config, {
+        execute: req.body?.execute !== false && config.commander?.executeRecovery !== false,
+        earliest: req.body?.earliest,
+      });
+      if (!command) return res.status(404).json({ error: 'incident not found' });
+      res.json(command);
+    } catch (err) {
+      res.status(500).json({ error: 'commander run failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/knowledge-graph', apiRateLimit(20), validateIncidentParam, async (req, res) => {
+    try {
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const evidence = await collectEvidence(incident, config);
+      const similarResult = await executeTool('find_related_incidents', {
+        path: incident.path, rootCause: incident.root_cause, earliest: '-30d',
+      }, config).catch(() => ({ incidents: [] }));
+      const graph = buildKnowledgeGraph({ incident, evidence, similar: similarResult.incidents || [] });
+      res.json({ ...graph, spec: dashboardVisualizationSpec() });
+    } catch (err) {
+      res.status(500).json({ error: 'knowledge graph failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/blast-radius', apiRateLimit(20), validateIncidentParam, async (req, res) => {
+    try {
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const result = await executeTool('estimate_blast_radius', {
+        service: incident.service, path: incident.path, earliest: '-1h',
+      }, config);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'blast radius estimation failed', message: err.message });
+    }
+  });
+
+  dashboardApp.post('/api/incidents/:id/simulate-recovery', apiRateLimit(10), validateIncidentParam, async (req, res) => {
+    try {
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const action = req.body?.action;
+      if (!action) return res.status(400).json({ error: 'action is required' });
+      const result = await executeTool('simulate_recovery', { incidentId: incident.id, action, path: incident.path }, config);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'recovery simulation failed', message: err.message });
+    }
+  });
+
+  dashboardApp.get('/api/incidents/:id/mttr', apiRateLimit(20), validateIncidentParam, async (req, res) => {
+    try {
+      const incident = await splunkDatastore.getIncidentById(req.params.id, config);
+      if (!incident) return res.status(404).json({ error: 'incident not found' });
+      const result = await executeTool('estimate_mttr', { path: incident.path, rootCause: incident.root_cause, earliest: '-30d' }, config);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'mttr estimation failed', message: err.message });
+    }
+  });
+
+
+  dashboardApp.get('/api/analytics/advanced', async (req, res) => {
     const hours = parseInt(req.query.hours) || 24;
     const since = Date.now() - hours * 60 * 60 * 1000;
     try {
-      const incidents = db.getIncidentGroups({ limit: 500, since });
-      const heals = db.getHealActions(500);
+      let incidents, heals, source = 'local';
+
+      if (config.splunk?.enabled) {
+        try {
+          const idx = config.splunk.index || 'logpilot';
+          const incidentQuery = `search index=${idx} type=incident earliest=-${hours}h | stats latest(rootCause) as rootCause latest(lastSeen) as lastSeen min(firstSeen) as firstSeen latest(lastAction) as lastAction by incidentId`;
+          const healQuery = `search index=${idx} type=heal earliest=-${hours}h | stats count by action success`;
+
+          const [incR, healR] = await Promise.all([
+            searchSplunk(incidentQuery, config),
+            searchSplunk(healQuery, config),
+          ]);
+
+          if (incR.source === 'splunk') {
+            source = 'splunk';
+            incidents = (incR.events || []).map(e => ({
+              root_cause: e.rootCause || 'Unknown',
+              last_seen: Number(e.lastSeen) || Date.now(),
+              first_seen: Number(e.firstSeen) || Date.now(),
+              last_action: e.lastAction || null,
+            }));
+            heals = (healR.events || []).flatMap(e => {
+              const n = Number(e.count) || 0;
+              return Array.from({ length: n }, () => ({ success: String(e.success) === '1' || e.success === true || e.success === 'true' }));
+            });
+          }
+        } catch (_) { /* fall through to local */ }
+      }
+
+      if (!incidents) {
+        incidents = db.getIncidentGroups({ limit: 500, since });
+        heals = db.getHealActions(500);
+        source = 'local';
+      }
 
       // Root cause distribution
       const rcaDist = {};
@@ -319,6 +454,7 @@ function startDashboard(port = 4321, config = {}) {
       });
 
       res.json({
+        source,
         rcaDistribution: Object.entries(rcaDist).map(([label, value]) => ({ label, value })),
         recoverySuccessRate,
         mttrMinutes: mttr,
@@ -381,23 +517,25 @@ function mapRootCauseToCategory(rootCause) {
 }
 
 async function getIncidentAnalysis(incidentId, config) {
-  const incident = db.getIncidentGroup(incidentId);
+  let incident = db.getIncidentGroup(Number(incidentId));
+  if (!incident) incident = await splunkDatastore.getIncidentById(incidentId, config);
   if (!incident) return null;
 
-  const cached = db.getIncidentAnalysis(incidentId);
+  const cacheKey = String(incident.id);
+  const cached = db.getIncidentAnalysis(cacheKey);
   if (cached && Date.now() - cached.updatedAt < 60 * 1000) return cached;
 
-  const context = await buildIncidentContext(incidentId, config);
+  const context = await buildIncidentContext(incident.id, config);
   if (!context) return null;
   const rca = await analyzeRootCause(context, config);
-  const recovery = verifyRecovery(incident, config);
+  const recovery = await verifyRecovery(incident, config);
   const healActions = db.getHealActions(100).filter(action => {
     const trigger = `${action.trigger_detail || ''} ${action.notes || ''}`;
     return !incident.path || trigger.includes(incident.path) || trigger.includes(incident.title || '');
   });
   const postmortem = generatePostmortem({ incident, context, rca, recovery, healActions });
-  const analysis = { incidentId, context, rca, recovery, postmortem, updatedAt: Date.now() };
-  db.upsertIncidentAnalysis(incidentId, analysis);
+  const analysis = { incidentId: cacheKey, context, rca, recovery, postmortem, updatedAt: Date.now() };
+  db.upsertIncidentAnalysis(cacheKey, analysis);
   return analysis;
 }
 
@@ -430,6 +568,9 @@ function buildDashboardHTML(port, config) {
   --border: #e8eaed;
   --border2: #dde0e5;
   --text: #1a1d23;
+  --text1: #1a1d23;
+  --text2: #4b5563;
+  --text4: #9ca3af;
   --text2: #4a5568;
   --text3: #8a94a6;
   --text4: #b0bac9;
@@ -900,7 +1041,7 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
     </div>
     <div class="sb-logo-text">
       <span class="sb-logo-name">LogPilot</span>
-      <span class="sb-logo-sub">HTTP Monitor</span>
+      <span class="sb-logo-sub">Splunk Incident Commander</span>
     </div>
   </div>
 
@@ -947,6 +1088,10 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
     <div class="sb-item" id="nav-analysis" onclick="navigate('analysis')">
       <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zm6-7a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1H9a1 1 0 01-1-1V4zm6 4a1 1 0 011-1h2a1 1 0 011 1v8a1 1 0 01-1 1h-2a1 1 0 01-1-1V8z"/></svg>
       RCA Reports
+    </div>
+    <div class="sb-item" id="nav-predictions" onclick="navigate('predictions')">
+      <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11.707 4.707a1 1 0 00-1.414-1.414L10 9.586 8.707 8.293a1 1 0 00-1.414 0l-2 2a1 1 0 101.414 1.414L8 10.414l1.293 1.293a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+      MLTK Predictions
     </div>
   </div>
 
@@ -1261,7 +1406,24 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
       </div>
     </div>
   </div>
+
+  <!-- MLTK PREDICTIONS PAGE -->
+  <div class="page" id="page-predictions">
+    <h1 class="page-title">MLTK Predictions</h1>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-header"><div class="card-title">Splunk Machine Learning Toolkit — Predictive Searches</div></div>
+      <div style="padding:4px 0;font-size:13px;color:var(--text2);line-height:1.6">
+        These SPL queries use Splunk MLTK to forecast latency spikes, memory exhaustion, and overall outage risk
+        directly from data stored in Splunk — turning raw telemetry into early warnings before incidents occur.
+        Requires <code>splunk.enabled: true</code> with the MLTK app installed on your Splunk instance.
+      </div>
+    </div>
+    <div id="predictions-list">
+      <div class="empty-state"><p>Loading predictive searches…</p></div>
+    </div>
+  </div>
 </div>
+
 </div>
 
 <!-- ── INCIDENT DETAIL MODAL ──────────────────────────── -->
@@ -1625,7 +1787,7 @@ function renderEventList() {
   el.innerHTML = incidents.slice(0, 6).map(g => {
     const dot = g.severity === 'critical' ? 'critical' : g.severity === 'warning' ? 'warning' : 'info';
     const action = g.last_action ? \` · \${g.last_action}\` : '';
-    return \`<div class="event-item" onclick="openIncidentModal(\${g.id})">
+    return \`<div class="event-item" onclick="openIncidentModal('\${g.id}')">
       <div class="event-dot \${dot}"></div>
       <div class="event-body">
         <div class="event-title">\${esc(g.title || 'Incident')}</div>
@@ -1649,7 +1811,7 @@ function renderIncidentList() {
     </tr></thead>
     <tbody>
       \${incidents.map(g => \`
-        <tr onclick="openIncidentModal(\${g.id})">
+        <tr onclick="openIncidentModal('\${g.id}')">
           <td>
             <div style="font-weight:500;color:var(--text)">\${esc(g.title||'Incident').slice(0,48)}</div>
             <div style="font-size:11px;color:var(--text3);margin-top:2px">\${esc(g.sample_message||'').slice(0,60)}</div>
@@ -1674,7 +1836,7 @@ function renderAll() {
 
 // ── INCIDENT MODAL ─────────────────────────────────────────
 function openIncidentModal(id) {
-  const group = incidents.find(g => g.id === id);
+  const group = incidents.find(g => String(g.id) === String(id));
   if (!group) return;
   activeModal = id;
   const severity = group.severity || 'warning';
@@ -1702,6 +1864,9 @@ function viewFullReport() {
 function closeModal() {
   document.getElementById('detail-overlay').classList.remove('open');
   document.body.style.overflow = '';
+  if (typeof stopEvidenceLiveRefresh === 'function') stopEvidenceLiveRefresh();
+  const investigateBtn = document.getElementById('btn-investigate');
+  if (investigateBtn) { investigateBtn.style.display = 'none'; investigateBtn.textContent = '\u{1F916} AI Investigate'; investigateBtn.disabled = false; }
   activeModal = null;
 }
 
@@ -1711,6 +1876,7 @@ function renderModalBody(group, events, related) {
   body.innerHTML = \`
     <div class="tab-row">
       <button class="tab-btn active" onclick="showIncidentTab('overview', this)">Overview</button>
+      <button class="tab-btn" onclick="showIncidentTab('commander', this)">⚡ Commander</button>
       <button class="tab-btn" onclick="showIncidentTab('evidence', this)">Evidence</button>
       <button class="tab-btn" onclick="showIncidentTab('correlation', this)">Correlation</button>
       <button class="tab-btn" onclick="showIncidentTab('similar', this)">Similar</button>
@@ -1749,7 +1915,7 @@ function renderModalBody(group, events, related) {
       </div>
       <div class="related-row">
         \${related.map(r => \`
-          <div class="related-chip" onclick="closeModal();openIncidentModal(\${r.id})">
+          <div class="related-chip" onclick="closeModal();openIncidentModal('\${r.id}')">
             <span class="badge \${r.severity==='critical'?'badge-red':'badge-yellow'}" style="font-size:10px">\${esc(r.root_cause||'?')}</span>
             <span style="color:var(--text2)">\${esc((r.title||'').slice(0,30))}</span>
             <span class="rc-count">\${r.count}</span>
@@ -1779,6 +1945,36 @@ function renderModalBody(group, events, related) {
       \${events.length > 12 ? \`<div style="padding:6px 0 2px 24px;font-size:11px;color:var(--text4)">\${events.length - 12} more events…</div>\` : ''}
     </div>
     </div>
+    <div class="tab-pane" id="tab-commander">
+      <div class="root-cause-box" style="margin-bottom:16px">
+        <div class="rc-label">Splunk-First Incident Commander</div>
+        <div class="rc-desc">Runs the full autonomous pipeline against Splunk: evidence collection → MCP investigation → timeline → correlation → similar incidents → RCA → recovery recommendation → execution → verification → executive postmortem → knowledge graph update.</div>
+        <button class="btn-primary" id="btn-run-commander" style="margin-top:12px" onclick="runCommander('\${group.id}')">▶ Run Commander Pipeline</button>
+      </div>
+      <div id="commander-output">
+        <div class="empty-state"><p>Click <strong>Run Commander Pipeline</strong> to execute the full Splunk-first investigation and remediation flow for this incident.</p></div>
+      </div>
+      <div class="grid2" style="margin-top:16px">
+        <div class="card">
+          <div class="card-header"><div class="card-title">🌐 Blast Radius</div>
+            <div class="card-action" onclick="loadBlastRadius('\${group.id}')">Check</div>
+          </div>
+          <div id="blast-radius-out" class="empty-state"><p style="font-size:12px">Not yet checked</p></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div class="card-title">⏱ Estimated MTTR</div>
+            <div class="card-action" onclick="loadMTTR('\${group.id}')">Estimate</div>
+          </div>
+          <div id="mttr-out" class="empty-state"><p style="font-size:12px">Not yet estimated</p></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-header"><div class="card-title">🧠 Knowledge Graph</div>
+          <div class="card-action" onclick="loadKnowledgeGraph('\${group.id}')">Build</div>
+        </div>
+        <div id="kg-out" class="empty-state"><p style="font-size:12px">Not yet built — Splunk evidence + similar incidents become nodes and edges here.</p></div>
+      </div>
+    </div>
     <div class="tab-pane" id="tab-evidence"><div class="empty-state"><p>Loading evidence...</p></div></div>
     <div class="tab-pane" id="tab-correlation"><div class="empty-state"><p>Building correlation graph...</p></div></div>
     <div class="tab-pane" id="tab-similar"><div class="empty-state"><p>Searching for similar incidents...</p></div></div>
@@ -1800,22 +1996,156 @@ function showIncidentTab(name, btn) {
 }
 
 function fetchIncidentAnalysis(id) {
-  // Fire all data fetches in parallel
-  const analysisP = fetch('/api/incidents/' + id + '/analysis').then(r => r.json()).catch(() => null);
-  const correlationP = fetch('/api/incidents/' + id + '/correlation').then(r => r.json()).catch(() => null);
-  const similarP = fetch('/api/incidents/' + id + '/similar').then(r => r.json()).catch(() => null);
-  const recsP = fetch('/api/incidents/' + id + '/recommendations').then(r => r.json()).catch(() => null);
-  const recoveryP = fetch('/api/incidents/' + id + '/recovery').then(r => r.json()).catch(() => null);
-  const evidenceP = fetch('/api/incidents/' + id + '/evidence').then(r => r.json()).catch(() => null);
+  // Fire all data fetches in parallel — show loading spinners
+  ['evidence','correlation','similar','rca','recommendations','recovery'].forEach(tab => {
+    const el = document.getElementById('tab-' + tab);
+    if (el) el.innerHTML = '<div class="empty-state" style="padding:20px 0"><span style="opacity:.5;font-size:12px">Loading ' + tab + '…</span></div>';
+  });
+
+  const analysisP     = fetch('/api/incidents/' + id + '/analysis').then(r => r.json()).catch(() => null);
+  const correlationP  = fetch('/api/incidents/' + id + '/correlation').then(r => r.json()).catch(() => null);
+  const similarP      = fetch('/api/incidents/' + id + '/similar').then(r => r.json()).catch(() => null);
+  const recsP         = fetch('/api/incidents/' + id + '/recommendations').then(r => r.json()).catch(() => null);
+  const recoveryP     = fetch('/api/incidents/' + id + '/recovery').then(r => r.json()).catch(() => null);
+  const evidenceP     = fetch('/api/incidents/' + id + '/evidence').then(r => r.json()).catch(() => null);
 
   analysisP.then(data => {
     if (data) { analyses[id] = data; renderIncidentAnalysis(data); renderAnalysisList(); }
   });
-  correlationP.then(graph => { if (graph) renderCorrelationTab(graph); });
-  similarP.then(data => { if (data) renderSimilarTab(data.similar || []); });
-  recsP.then(data => { if (data) renderRecommendationsTab(data.recommendations || []); });
-  recoveryP.then(data => { if (data) renderRecoveryTab(data); });
-  evidenceP.then(data => { if (data) renderEvidenceTab(data); });
+  correlationP.then(graph => {
+    if (graph) renderCorrelationTab(graph);
+    else {
+      const el = document.getElementById('tab-correlation');
+      if (el) el.innerHTML = '<div class="empty-state"><p>No correlation data yet — click <strong>🤖 AI Investigate</strong> to build the graph.</p></div>';
+    }
+  });
+  similarP.then(data => { renderSimilarTab(data?.similar || []); });
+  recsP.then(data => { renderRecommendationsTab(data?.recommendations || []); });
+  recoveryP.then(data => {
+    if (data) renderRecoveryTab(data);
+    else {
+      const el = document.getElementById('tab-recovery');
+      if (el) el.innerHTML = '<div class="empty-state"><p>Recovery data not available yet.</p></div>';
+    }
+  });
+  evidenceP.then(data => {
+    if (data) renderEvidenceTab(data);
+    else {
+      const el = document.getElementById('tab-evidence');
+      if (el) el.innerHTML = '<div class="empty-state"><p>No evidence collected yet — click <strong>🤖 AI Investigate</strong> to gather evidence.</p></div>';
+    }
+  });
+}
+
+// ── INCIDENT COMMANDER (Splunk-first pipeline) ─────────────────
+function runCommander(id) {
+  const out = document.getElementById('commander-output');
+  const btn = document.getElementById('btn-run-commander');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running pipeline…'; }
+  out.innerHTML = '<div class="empty-state"><p>Running full Splunk-first commander pipeline… this collects evidence, investigates via MCP tools, builds the timeline & knowledge graph, scores recovery confidence, and generates an executive postmortem.</p></div>';
+
+  fetch('/api/commander/run/' + id, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ execute: false }) })
+    .then(r => r.json())
+    .then(cmd => {
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Run Commander Pipeline'; }
+      if (cmd.error) { out.innerHTML = '<div class="empty-state"><p style="color:var(--red)">' + esc(cmd.error) + ': ' + esc(cmd.message||'') + '</p></div>'; return; }
+
+      const stepsHtml = (cmd.steps||[]).map(s => \`
+        <div class="event-item">
+          <div class="event-dot \${s.status==='completed'?'success':'critical'}"></div>
+          <div class="event-body">
+            <div class="event-title">\${esc(s.name.replace(/_/g,' '))}</div>
+            <div class="event-sub">\${s.status} · \${(s.completedAt - s.startedAt)}ms\${s.error ? ' · '+esc(s.error) : ''}</div>
+          </div>
+        </div>
+      \`).join('');
+
+      const rca = cmd.root_cause_analysis || {};
+      const recovery = cmd.recovery_execution || {};
+      const verified = cmd.recovery_verification || {};
+
+      out.innerHTML = \`
+        <div class="root-cause-box" style="margin-bottom:12px">
+          <div class="rc-label">Root Cause (via \${esc(rca.source||'commander')})</div>
+          <div class="rc-title">\${esc(rca.rootCause || 'Unknown')}</div>
+          <div class="rc-desc">Confidence: \${rca.confidence || 0}%</div>
+        </div>
+        <div class="detail-stat-row" style="margin-bottom:12px">
+          <div class="detail-stat">
+            <div class="detail-stat-label">Recovery Action</div>
+            <div class="detail-stat-val" style="font-size:13px">\${esc(recovery.action || '—')}</div>
+          </div>
+          <div class="detail-stat">
+            <div class="detail-stat-label">Executed</div>
+            <div class="detail-stat-val" style="font-size:13px">\${recovery.executed ? 'Yes' : 'No (dry run)'}</div>
+          </div>
+          <div class="detail-stat">
+            <div class="detail-stat-label">Resolved</div>
+            <div class="detail-stat-val" style="font-size:13px">\${verified.resolved ? '✅ Yes' : '⏳ Pending'}</div>
+          </div>
+        </div>
+        <div class="section-label">Pipeline Steps (\${(cmd.steps||[]).length})</div>
+        <div class="timeline-list" style="margin-bottom:12px">\${stepsHtml}</div>
+        \${cmd.postmortem_generation ? \`
+          <div class="section-label">Executive Postmortem</div>
+          <pre style="white-space:pre-wrap;font-size:12px;background:var(--bg2);padding:12px;border-radius:8px;max-height:240px;overflow:auto;border:1px solid var(--border)">\${esc(typeof cmd.postmortem_generation === 'string' ? cmd.postmortem_generation : JSON.stringify(cmd.postmortem_generation, null, 2))}</pre>
+        \` : ''}
+      \`;
+    })
+    .catch(err => {
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Run Commander Pipeline'; }
+      out.innerHTML = '<div class="empty-state"><p style="color:var(--red)">Commander run failed: ' + esc(err.message) + '</p></div>';
+    });
+}
+
+function loadBlastRadius(id) {
+  const el = document.getElementById('blast-radius-out');
+  el.innerHTML = '<div class="empty-state"><p style="font-size:12px">Checking…</p></div>';
+  fetch('/api/incidents/' + id + '/blast-radius').then(r => r.json()).then(data => {
+    if (data.error) { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(data.error) + '</p></div>'; return; }
+    el.innerHTML = \`
+      <div class="detail-stat-row">
+        <div class="detail-stat"><div class="detail-stat-label">Events</div><div class="detail-stat-val">\${data.events||0}</div></div>
+        <div class="detail-stat"><div class="detail-stat-label">Affected Paths</div><div class="detail-stat-val">\${data.affectedPathCount||0}</div></div>
+        <div class="detail-stat"><div class="detail-stat-label">Affected Services</div><div class="detail-stat-val">\${data.affectedServiceCount||0}</div></div>
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:var(--text2)">Source: \${esc(data.source||'local')}\${(data.affectedPaths||[]).length ? ' · Paths: '+data.affectedPaths.map(esc).join(', ') : ''}</div>
+    \`;
+  }).catch(err => { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(err.message) + '</p></div>'; });
+}
+
+function loadMTTR(id) {
+  const el = document.getElementById('mttr-out');
+  el.innerHTML = '<div class="empty-state"><p style="font-size:12px">Estimating…</p></div>';
+  fetch('/api/incidents/' + id + '/mttr').then(r => r.json()).then(data => {
+    if (data.error) { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(data.error) + '</p></div>'; return; }
+    el.innerHTML = \`
+      <div class="detail-stat" style="margin-bottom:8px"><div class="detail-stat-label">Mean Time To Recovery</div><div class="detail-stat-val">\${data.meanMinutes||0} min</div></div>
+      <div style="font-size:12px;color:var(--text2)">Source: \${esc(data.source||'local')} · based on \${(data.basis?.relatedIncidents ?? data.basis?.heals ?? 0)} historical record(s)</div>
+    \`;
+  }).catch(err => { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(err.message) + '</p></div>'; });
+}
+
+function loadKnowledgeGraph(id) {
+  const el = document.getElementById('kg-out');
+  el.innerHTML = '<div class="empty-state"><p style="font-size:12px">Building graph from Splunk evidence…</p></div>';
+  fetch('/api/incidents/' + id + '/knowledge-graph').then(r => r.json()).then(graph => {
+    if (graph.error) { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(graph.error) + '</p></div>'; return; }
+    const typeColors = { Incident:'#dc2626', Service:'#2563eb', Deployment:'#7c3aed', Metric:'#16a34a', Trace:'#0891b2', Error:'#ea580c', Recovery:'#059669', Postmortem:'#64748b' };
+    const grouped = {};
+    (graph.nodes||[]).forEach(n => { (grouped[n.type] = grouped[n.type] || []).push(n); });
+    el.innerHTML = \`
+      <div style="font-size:12px;color:var(--text2);margin-bottom:10px">\${(graph.nodes||[]).length} nodes · \${(graph.edges||[]).length} edges · layout: \${esc(graph.spec?.layout||'force-directed')}</div>
+      \${Object.entries(grouped).map(([type, nodes]) => \`
+        <div style="margin-bottom:10px">
+          <div style="font-size:11px;font-weight:600;color:\${typeColors[type]||'var(--text2)'};margin-bottom:4px">\${esc(type)} (\${nodes.length})</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            \${nodes.slice(0,10).map(n => \`<span class="badge" style="border-color:\${typeColors[type]||'var(--border)'};color:\${typeColors[type]||'var(--text2)'}" title="\${esc(JSON.stringify(n.data||{}).slice(0,200))}">\${esc(n.label)}</span>\`).join('')}
+          </div>
+        </div>
+      \`).join('')}
+    \`;
+  }).catch(err => { el.innerHTML = '<div class="empty-state"><p style="font-size:12px;color:var(--red)">' + esc(err.message) + '</p></div>'; });
 }
 
 
@@ -1830,7 +2160,7 @@ function renderAnalysisList() {
   el.innerHTML = rows.map(a => {
     const inc = a.context?.incident || {};
     return \`
-      <div class="event-item" onclick="openIncidentModal(\${inc.id})">
+      <div class="event-item" onclick="openIncidentModal('\${inc.id}')">
         <div class="event-dot \${inc.severity === 'critical' ? 'critical' : 'warning'}"></div>
         <div class="event-body">
           <div class="event-title">\${esc(inc.title || 'Incident analysis')}</div>
@@ -2048,6 +2378,7 @@ function navigate(page) {
   if (page === 'memory') fetchSnaps();
   if (page === 'splunk')   { fetchSplunkHealth(); }
   if (page === 'analysis') { fetchAnalytics(); renderAnalysisList(); fetchAdvancedAnalytics(); }
+  if (page === 'predictions') fetchPredictions();
 }
 
 // ── HELPERS ─────────────────────────────────────────────────

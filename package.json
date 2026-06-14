@@ -1,31 +1,51 @@
 {
   "name": "logpilot",
-  "version": "1.0.0",
-  "description": "Zero-config monitoring, NLP log search, and self-healing for Node.js apps",
+  "version": "2.0.0",
+  "description": "Splunk-first Incident Commander for Node.js — autonomous evidence collection, MCP-driven AI investigation, MLTK predictions, self-healing, and executive postmortems. Drop-in Express middleware with a live dashboard.",
   "main": "src/index.js",
   "files": [
     "src",
     "README.md",
+    "LICENSE",
     "logpilot.config.example.js"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "test": "node test/smoke.js",
+    "test": "node src/tests/smoke.js",
     "demo": "node test/demo-app.js"
   },
   "keywords": [
+    "splunk",
+    "splunk-mcp",
+    "incident-commander",
+    "observability",
     "monitoring",
     "logging",
     "self-healing",
+    "root-cause-analysis",
+    "mltk",
+    "ai-agent",
+    "mcp",
     "nlp",
     "devops",
-    "observability",
-    "circuit-breaker"
+    "circuit-breaker",
+    "postmortem",
+    "express",
+    "middleware"
   ],
   "author": "logpilot",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/logpilot/logpilot.git"
+  },
+  "homepage": "https://github.com/logpilot/logpilot#readme",
+  "bugs": {
+    "url": "https://github.com/logpilot/logpilot/issues"
+  },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
-    "@qdrant/js-client-rest": "^1.18.0",
     "chalk": "^4.1.2",
     "cron": "^3.1.6",
     "dotenv": "^17.4.2",
@@ -33,5 +53,9 @@
     "node-fetch": "^2.7.0",
     "sql.js": "^1.14.1",
     "ws": "^8.16.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@qdrant/js-client-rest": "^1.18.0"
   }
 }

@@ -23,7 +23,7 @@ const db = require('../storage/db');
  * @param {object} context  - from buildIncidentContext()
  * @returns {{ nodes, edges, confidence }}
  */
-function buildCorrelationGraph(context) {
+async function buildCorrelationGraph(context, config = {}) {
   const g = new CorrelationGraph();
   const incident = context.incident || {};
   const incidentNodeId = `incident:${incident.id}`;
@@ -108,18 +108,23 @@ function buildCorrelationGraph(context) {
     });
   }
 
-  // ── Heal actions ─────────────────────────────────────────────────────────
-  const healActions = db.getHealActions(20).filter(a => {
-    // Only heals within ±30min of the incident
+  // ── Heal actions (Splunk-first via evidence, SQLite fallback) ────────────
+  const evidenceHeals = context.evidence?.heals;
+  let healActions = [];
+  if (evidenceHeals?.raw?.length) {
+    healActions = evidenceHeals.raw;
+  } else if (evidenceHeals?.source === 'local' || !evidenceHeals) {
     const incidentTime = incident.first_seen || Date.now();
-    return Math.abs(a.timestamp - incidentTime) < 30 * 60 * 1000;
-  });
+    healActions = db.getHealActions(20).filter(a =>
+      Math.abs(a.timestamp - incidentTime) < 30 * 60 * 1000
+    );
+  }
 
-  healActions.forEach((heal, i) => {
-    const healNodeId = `heal:${heal.id || i}`;
-    g.addNode(healNodeId, 'heal_action', `${heal.action} via ${heal.rule_name}`, {
+  healActions.slice(0, 10).forEach((heal, i) => {
+    const healNodeId = `heal:${heal.id || heal.action || i}`;
+    g.addNode(healNodeId, 'heal_action', `${heal.action} via ${heal.rule_name || heal.ruleName || 'rule'}`, {
       action: heal.action,
-      rule: heal.rule_name,
+      rule: heal.rule_name || heal.ruleName,
       success: heal.success,
       timestamp: heal.timestamp,
     });
@@ -128,8 +133,26 @@ function buildCorrelationGraph(context) {
     });
   });
 
-  // ── Previous / related incidents ─────────────────────────────────────────
-  const related = db.getRelatedIncidents(incident.id);
+  // ── Previous / related incidents (Splunk-first via MCP tool) ─────────────
+  let related = [];
+  if (config.splunk?.enabled) {
+    try {
+      const { executeTool } = require('../mcp/tools');
+      const result = await executeTool('find_related_incidents', {
+        path: incident.path, rootCause: incident.root_cause, earliest: '-7d',
+      }, config);
+      related = (result.incidents || [])
+        .filter(r => String(r.incidentId) !== String(incident.id) && String(r.incidentId) !== String(incident.incidentId))
+        .map(r => ({
+          id: r.incidentId, title: r.title || `${r.rootCause || 'Incident'} on ${r.path || 'service'}`,
+          severity: r.severity, root_cause: r.rootCause, last_seen: r.lastSeen || r._time,
+        }));
+    } catch (_) {}
+  }
+  if (!related.length && db.getRelatedIncidents) {
+    related = db.getRelatedIncidents(Number(incident.id) || 0) || [];
+  }
+
   related.slice(0, 5).forEach(rel => {
     const relNodeId = `incident:${rel.id}`;
     g.addNode(relNodeId, 'related_incident', rel.title || `Incident #${rel.id}`, {

@@ -22,6 +22,18 @@ function test(name, fn) {
   }
 }
 
+async function asyncTest(name, fn) {
+  try {
+    await fn();
+    console.log(`  ✓  ${name}`);
+    passed++;
+  } catch (e) {
+    console.error(`  ✗  ${name}`);
+    console.error(`     ${e.message}`);
+    failed++;
+  }
+}
+
 function assert(condition, msg) {
   if (!condition) throw new Error(msg || 'Assertion failed');
 }
@@ -252,9 +264,9 @@ test('isMCPEnabled returns true when explicitly enabled', () => {
   assert(isMCPEnabled({ mcp: { enabled: true } }), 'should be enabled');
 });
 
-test('getToolDefinitions returns 6 tools', () => {
+test('getToolDefinitions returns 11 tools', () => {
   const tools = getToolDefinitions();
-  assertEqual(tools.length, 6, `expected 6 tools, got ${tools.length}`);
+  assertEqual(tools.length, 11, `expected 11 tools, got ${tools.length}`);
 });
 
 test('all tool definitions have name, description, and params', () => {
@@ -270,6 +282,8 @@ test('tool names match expected set', () => {
   const expected = new Set([
     'search_logs', 'find_deployments', 'find_related_incidents',
     'get_trace', 'get_metric_history', 'get_heal_history',
+    'simulate_recovery', 'estimate_blast_radius', 'predict_incident_growth',
+    'estimate_mttr', 'explain_failure_pattern',
   ]);
   const tools = getToolDefinitions();
   tools.forEach(t => assert(expected.has(t.name), `unexpected tool: ${t.name}`));
@@ -354,6 +368,191 @@ test('ACTIONS object has all expected keys', () => {
   expected.forEach(k => assert(k in ACTIONS, `missing ACTIONS.${k}`));
 });
 
+// ── Splunk-first source-of-truth tests (async) ─────────────────────────────
+(async () => {
+
+console.log('\nSplunk-first — Similar Incidents');
+
+const { findSimilarIncidents } = require('../similarity/incident-search');
+
+await asyncTest('findSimilarIncidents falls back to local when Splunk disabled', async () => {
+  const incident = { id: 999999, path: '/api/test', root_cause: 'Timeout', title: 'Test incident' };
+  const results = await findSimilarIncidents(incident, { config: { splunk: { enabled: false } } });
+  assert(Array.isArray(results), 'should return an array');
+});
+
+await asyncTest('findSimilarIncidents accepts config in opts without throwing', async () => {
+  const incident = { id: 1, path: '/api/x', root_cause: 'Memory', title: 'Mem incident' };
+  const results = await findSimilarIncidents(incident, { limit: 3, threshold: 25, config: { splunk: { enabled: false } } });
+  assert(Array.isArray(results), 'should not throw with config passed');
+});
+
+await asyncTest('findSimilarIncidents returns empty array for null incident', async () => {
+  const results = await findSimilarIncidents(null, { config: {} });
+  assertEqual(results.length, 0, 'null incident -> empty array');
+});
+
+console.log('\nSplunk-first — MetricCorrelator');
+
+const { correlateMetrics } = require('../correlation/MetricCorrelator');
+
+await asyncTest('correlateMetrics returns local source when Splunk disabled', async () => {
+  const incident = { first_seen: Date.now() - 60000, last_seen: Date.now(), path: '/api/x' };
+  const result = await correlateMetrics(incident, { splunk: { enabled: false } });
+  assertEqual(result.source, 'local', 'should use local source when Splunk disabled');
+  assert('maxCpu' in result && 'maxMemory' in result && 'cpuSpike' in result, 'should have full metric shape');
+});
+
+await asyncTest('correlateMetrics falls back to local when Splunk enabled but unreachable', async () => {
+  const incident = { first_seen: Date.now() - 60000, last_seen: Date.now(), path: '/api/x' };
+  const result = await correlateMetrics(incident, { splunk: { enabled: true, hecUrl: 'http://localhost:1', index: 'logpilot' } });
+  assert(result.source === 'local' || result.source === 'splunk', 'should resolve to a valid source');
+  assert(Number.isFinite(result.maxCpu), 'maxCpu should be numeric');
+});
+
+console.log('\nSplunk-first — Correlation Graph (async)');
+
+const { buildCorrelationGraph } = require('../correlation/correlator');
+
+await asyncTest('buildCorrelationGraph is async and returns nodes/edges/confidence', async () => {
+  const context = {
+    incident: { id: 1, title: 'Test incident', path: '/api/x', root_cause: 'Memory', count: 5, first_seen: Date.now() - 60000, last_seen: Date.now() },
+    logs: { count: 10, dominantErrors: [] },
+    metrics: { samples: 5, maxCpu: 50, maxMemory: 50, memorySpike: false, cpuSpike: false },
+  };
+  const graph = await buildCorrelationGraph(context, { splunk: { enabled: false } });
+  assert(Array.isArray(graph.nodes), 'should have nodes array');
+  assert(Array.isArray(graph.edges), 'should have edges array');
+  assert(typeof graph.confidence === 'number', 'should have numeric confidence');
+  assert(graph.nodes.some(n => n.type === 'incident'), 'should have root incident node');
+});
+
+await asyncTest('buildCorrelationGraph works with config-less call (defaults)', async () => {
+  const context = {
+    incident: { id: 2, title: 'Test 2', path: '/api/y', root_cause: 'Timeout', count: 1, first_seen: Date.now(), last_seen: Date.now() },
+    logs: { count: 0, dominantErrors: [] },
+    metrics: { samples: 0, maxCpu: 0, maxMemory: 0 },
+  };
+  const graph = await buildCorrelationGraph(context);
+  assert(Array.isArray(graph.nodes), 'should not throw without config');
+});
+
+console.log('\nNon-numeric incident ID safety (Splunk-sourced ids)');
+
+const db = require('../storage/db');
+
+await asyncTest('upsertIncidentAnalysis silently skips non-numeric incident IDs', () => {
+  // Should not throw for a Splunk-style string id
+  db.upsertIncidentAnalysis('splunk-abc123', { context: {}, rca: {}, recovery: {} });
+});
+
+await asyncTest('getIncidentAnalysis returns null for non-numeric incident IDs', () => {
+  const result = db.getIncidentAnalysis('splunk-abc123');
+  assertEqual(result, null, 'non-numeric id should return null, not throw or collide');
+});
+
+await asyncTest('saveEvidenceSnapshot silently skips non-numeric incident IDs', () => {
+  db.saveEvidenceSnapshot('splunk-xyz', { source: 'splunk', logs: {}, metrics: {} });
+});
+
+await asyncTest('getEvidenceSnapshot returns null for non-numeric incident IDs', () => {
+  const result = db.getEvidenceSnapshot('splunk-xyz');
+  assertEqual(result, null, 'non-numeric id should return null');
+});
+
+console.log('\nEvidence Collector — Splunk path field completeness');
+
+const collectorSrc2 = require('fs').readFileSync(
+  require('path').join(__dirname, '../investigator/evidence/collector.js'), 'utf8');
+
+test('collectFromSplunk computes errorRate', () => {
+  assert(collectorSrc2.includes('splunkErrorRate'), 'should compute splunkErrorRate');
+});
+test('collectFromSplunk computes response time stats (avg/max/p95)', () => {
+  assert(collectorSrc2.includes('weightedAvgRt') && collectorSrc2.includes('maxRtSplunk') && collectorSrc2.includes('p95RtSplunk'),
+    'should compute avg/max/p95 response times');
+});
+test('collectFromSplunk computes statusCodes breakdown', () => {
+  assert(collectorSrc2.includes('splunkStatusCodes'), 'should compute status code breakdown');
+});
+test('collectFromSplunk computes metricSeries for sparklines', () => {
+  assert(collectorSrc2.includes('metricSeries') && collectorSrc2.includes('metricSeriesR'), 'should compute metric series');
+});
+test('collectFromSplunk computes anomalies from metrics', () => {
+  assert(collectorSrc2.includes('computedAnomalies'), 'should compute anomalies from Splunk metrics');
+});
+test('collectEvidence detects total Splunk unreachability and falls back to local', () => {
+  assert(collectorSrc2.includes('splunkHits === 0') && collectorSrc2.includes('throw new Error'),
+    'should detect when all sub-queries degrade to local and throw to trigger fallback');
+});
+test('collectEvidence surfaces splunkStatus:unreachable on local fallback', () => {
+  assert(collectorSrc2.includes("evidence.splunkStatus = 'unreachable'"), 'should mark local evidence as splunk-unreachable');
+});
+
+console.log('\nIncident ID validation middleware');
+
+const serverSrc = require('fs').readFileSync(
+  require('path').join(__dirname, '../dashboard/server.js'), 'utf8');
+
+test('server.js has validateIncidentParam supporting splunk-N ids', () => {
+  assert(serverSrc.includes('function validateIncidentParam'), 'should define validateIncidentParam');
+  assert(serverSrc.includes('splunk-'), 'should support splunk-N id format');
+});
+test('server.js applies validateIncidentParam to incident routes', () => {
+  const matches = serverSrc.match(/validateIncidentParam/g) || [];
+  assert(matches.length >= 10, `should apply to many routes, found ${matches.length}`);
+});
+test('server.js awaits verifyRecovery (no missing await regression)', () => {
+  assert(serverSrc.includes('const recovery = await verifyRecovery('), 'verifyRecovery must be awaited');
+});
+test('server.js imports searchSplunk for analytics', () => {
+  assert(serverSrc.includes("require('../integrations/splunk/splunkSearch')"), 'should import searchSplunk');
+});
+test('server.js /api/analytics/advanced is Splunk-first', () => {
+  const idx = serverSrc.indexOf("dashboardApp.get('/api/analytics/advanced'");
+  const chunk = serverSrc.slice(idx, idx + 2000);
+  assert(chunk.includes('config.splunk?.enabled'), 'analytics should check Splunk first');
+});
+
+console.log('\nSplunk source-of-truth: similarity module');
+
+const similaritySrc = require('fs').readFileSync(
+  require('path').join(__dirname, '../similarity/incident-search.js'), 'utf8');
+
+test('incident-search.js queries Splunk first via find_related_incidents', () => {
+  assert(similaritySrc.includes('find_related_incidents'), 'should call find_related_incidents MCP tool');
+});
+test('incident-search.js uses TF-IDF embeddings for re-ranking', () => {
+  assert(similaritySrc.includes('rankByEmbedding'), 'should use TF-IDF embeddings');
+});
+test('incident-search.js falls back to local only when splunk disabled/unreachable', () => {
+  assert(similaritySrc.includes("config.splunk?.enabled") && similaritySrc.includes('findSimilarFromLocal'),
+    'should have explicit local fallback path');
+});
+
+const correlatorSrc = require('fs').readFileSync(
+  require('path').join(__dirname, '../correlation/correlator.js'), 'utf8');
+
+test('correlator.js uses find_related_incidents for related incidents (Splunk-first)', () => {
+  assert(correlatorSrc.includes('find_related_incidents'), 'should query Splunk for related incidents');
+});
+test('correlator.js heal actions come from evidence (Splunk-first) with local fallback', () => {
+  assert(correlatorSrc.includes('evidenceHeals') && correlatorSrc.includes('db.getHealActions'),
+    'should prefer evidence heals, fall back to local');
+});
+
+const metricCorrSrc = require('fs').readFileSync(
+  require('path').join(__dirname, '../correlation/MetricCorrelator.js'), 'utf8');
+
+test('MetricCorrelator.js queries Splunk metrics first', () => {
+  assert(metricCorrSrc.includes('type=metric') && metricCorrSrc.includes('config.splunk?.enabled'),
+    'should query Splunk type=metric when enabled');
+});
+test('MetricCorrelator.js falls back to local SQLite metrics', () => {
+  assert(metricCorrSrc.includes("source: 'local'") && metricCorrSrc.includes('getRecentMetrics'),
+    'should fall back to local metrics');
+});
+
 // ── Summary ──────────────────────────────────────────────────────────────────
 console.log(`\n${'─'.repeat(50)}`);
 const total = passed + failed;
@@ -363,6 +562,8 @@ if (failed === 0) {
   console.log(`Results: ${passed}/${total} passed, ${failed} failed`);
   process.exit(1);
 }
+
+})();
 
 // ── Phase 11: HEC client — production hardening ───────────────────────────
 console.log('\nPhase 11 — HEC Client (production hardening)');
@@ -570,4 +771,132 @@ test('generatePostmortem includes similar incidents when provided', () => {
   const pm = generatePostmortem({ incident: mockIncident, context: mockContext, rca: mockRca, recovery: mockRecovery, similar });
   assert(pm.includes('Similar Historical Incidents'), 'similar incidents section should appear');
   assert(pm.includes('#5'), 'similar incident ID should appear');
+});
+
+// ── Evidence Collector (rich local mode) ──────────────────────────────────
+console.log('\nEvidence Collector — local mode');
+
+// Test the helper functions directly without needing DB
+const collectorPath = require('path').join(__dirname, '../investigator/evidence/collector.js');
+const collectorSrc  = require('fs').readFileSync(collectorPath, 'utf8');
+
+test('collector.js exports collectEvidence function', () => {
+  assert(collectorSrc.includes('module.exports = { collectEvidence }'), 'should export collectEvidence');
+});
+
+test('collector.js has normalizeMessage helper', () => {
+  assert(collectorSrc.includes('function normalizeMessage'), 'should have normalizeMessage');
+});
+
+test('collector.js has countBy helper', () => {
+  assert(collectorSrc.includes('function countBy'), 'should have countBy helper');
+});
+
+test('collector.js handles local AND splunk paths', () => {
+  assert(collectorSrc.includes('collectFromLocal'), 'should have collectFromLocal');
+  assert(collectorSrc.includes('collectFromSplunk'), 'should have collectFromSplunk');
+});
+
+test('collector.js returns anomalies array', () => {
+  assert(collectorSrc.includes('anomalies:'), 'should return anomalies');
+});
+
+test('collector.js returns traces array', () => {
+  assert(collectorSrc.includes('traces:'), 'should return traces');
+});
+
+test('collector.js returns errorTimeline array', () => {
+  assert(collectorSrc.includes('errorTimeline'), 'should return errorTimeline');
+});
+
+test('collector.js returns response time percentiles', () => {
+  assert(collectorSrc.includes('p95ResponseMs') || collectorSrc.includes('p95Rt'), 'should have p95 response time');
+});
+
+// ── Interactive graph + Evidence tab (dashboard-ext) ─────────────────────
+console.log('\nInteractive Graph + Evidence — dashboard-ext.js');
+
+const extSrc = require('fs').readFileSync(
+  require('path').join(__dirname, '../dashboard/dashboard-ext.js'), 'utf8');
+
+// Graph
+test('dashboard-ext has force simulation', () => {
+  assert(extSrc.includes('function simulate'), 'should have simulate() loop');
+});
+test('dashboard-ext has draw function', () => {
+  assert(extSrc.includes('function draw'), 'should have draw()');
+});
+test('dashboard-ext has full mouse interaction', () => {
+  assert(extSrc.includes('mousedown') && extSrc.includes('mousemove') && extSrc.includes('mouseup'), 'full mouse events');
+});
+test('dashboard-ext has zoom/pan via wheel', () => {
+  assert(extSrc.includes('wheel') && extSrc.includes('zoom'), 'wheel zoom');
+});
+test('dashboard-ext NODE_COLORS covers all types', () => {
+  ['incident','logs','metrics','deployment','heal_action','error_burst','memory_spike']
+    .forEach(t => assert(extSrc.includes("'"+t+"'") || extSrc.includes(t+":"), 'missing color for: ' + t));
+});
+test('dashboard-ext EDGE_COLORS covers relation types', () => {
+  ['CAUSED_BY','CORRELATED_LOG','CORRELATED_METRIC','CORRELATED_DEPLOY']
+    .forEach(r => assert(extSrc.includes(r), 'missing edge color: ' + r));
+});
+test('dashboard-ext has tooltip on hover', () => {
+  assert(extSrc.includes('graph-tooltip'), 'tooltip element');
+});
+test('dashboard-ext shows node detail panel on click', () => {
+  assert(extSrc.includes('graph-detail') && extSrc.includes('showNodeDetail'), 'detail panel');
+});
+
+// Evidence tab
+test('dashboard-ext evidence tab has sparkline renderer', () => {
+  assert(extSrc.includes('function sparkline'), 'should have sparkline()');
+});
+test('dashboard-ext evidence tab has gauge bar renderer', () => {
+  assert(extSrc.includes('function gaugeBar'), 'should have gaugeBar()');
+});
+test('dashboard-ext evidence tab has error timeline renderer', () => {
+  assert(extSrc.includes('function renderTimeline'), 'should have renderTimeline()');
+});
+test('dashboard-ext evidence tab has live polling', () => {
+  assert(extSrc.includes('startEvidenceLiveRefresh') && extSrc.includes('stopEvidenceLiveRefresh'), 'live polling functions');
+});
+test('dashboard-ext evidence tab polls every 15s', () => {
+  assert(extSrc.includes('15000'), '15 second poll interval');
+});
+test('dashboard-ext evidence tab has manual refresh button', () => {
+  assert(extSrc.includes('function refreshEvidence'), 'manual refresh function');
+});
+test('dashboard-ext anomaly cards are expandable', () => {
+  assert(extSrc.includes('toggleAnomalyDetail'), 'expandable anomaly cards');
+});
+test('dashboard-ext anomaly cards show recommended action', () => {
+  assert(extSrc.includes('Recommended action'), 'recommended action text in anomaly detail');
+});
+test('dashboard-ext anomaly cards have severity gradient bar', () => {
+  assert(extSrc.includes('sevColor') && extSrc.includes('threshold'), 'severity gradient with threshold');
+});
+test('dashboard-ext evidence shows SPIKE warning for metrics', () => {
+  assert(extSrc.includes('⚠ SPIKE') && extSrc.includes('cpuSpike'), 'spike warning indicator');
+});
+test('dashboard-ext evidence KPI grid shows 6 stats', () => {
+  assert(extSrc.includes('Log Events') && extSrc.includes('Error Rate') && extSrc.includes('Anomalies')
+    && extSrc.includes('Heal Actions') && extSrc.includes('Max Response') && extSrc.includes('Related Incidents'), '6 KPIs');
+});
+test('dashboard-ext evidence shows status code pills', () => {
+  assert(extSrc.includes('statusCodes') && extSrc.includes('statusColor'), 'status code breakdown');
+});
+test('dashboard-ext evidence shows response time P95', () => {
+  assert(extSrc.includes('P95') && extSrc.includes('p95ResponseMs'), 'P95 response time');
+});
+test('dashboard-ext Splunk health shows disabled state with setup instructions', () => {
+  assert(extSrc.includes('SPLUNK_SETUP.md'), 'setup guide reference');
+});
+test('dashboard-ext fetchSplunkHealth exists', () => {
+  assert(extSrc.includes('function fetchSplunkHealth'), 'fetchSplunkHealth function');
+});
+test('dashboard-ext renderRecommendationsTab shows action icons', () => {
+  assert(extSrc.includes('actionIcons') && extSrc.includes("'gc'"), 'action icons map');
+});
+test('dashboard-ext renderRecommendationsTab shows confidence bars', () => {
+  assert(extSrc.includes('confPct'), 'confidence percentage bars');
 });

@@ -45,7 +45,8 @@ function tokenise(str) {
  *   - same status code         → +10
  */
 function scoreIncidentSimilarity(incidentA, incidentB) {
-  if (!incidentA || !incidentB || incidentA.id === incidentB.id) return 0;
+  if (!incidentA || !incidentB) return 0;
+  if (incidentA.id != null && incidentB.id != null && incidentA.id === incidentB.id) return 0;
 
   let score = 0;
 

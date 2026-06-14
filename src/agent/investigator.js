@@ -25,6 +25,7 @@ const { chat, isAIConfigured } = require('./reasoning');
 const { analyzeRootCause } = require('../ai/RootCauseEngine');  // deterministic fallback
 const db = require('../storage/db');
 const { getService: getSplunkService } = require('../integrations/splunk/service');
+const { getIncidentById } = require('../integrations/splunk/datastore');
 
 /**
  * Run the full AI investigation for a given incident ID.
@@ -34,19 +35,20 @@ const { getService: getSplunkService } = require('../integrations/splunk/service
  * @returns {Promise<object>}
  */
 async function investigate(incidentId, config = {}) {
-  const id = Number(incidentId);
-  const incident = db.getIncidentGroup(id);
+  let incident = db.getIncidentGroup(Number(incidentId));
+  if (!incident) incident = await getIncidentById(incidentId, config);
   if (!incident) return null;
+  const id = incident.id;
 
   // ── Step 1: Gather evidence + build incident context ─────────────────────
   const context = await buildIncidentContext(id, config);
   if (!context) return null;
 
   // ── Step 2: Build correlation graph ──────────────────────────────────────
-  const correlationGraph = buildCorrelationGraph(context);
+  const correlationGraph = await buildCorrelationGraph(context, config);
 
   // ── Step 3: Find similar incidents ───────────────────────────────────────
-  const similar = await findSimilarIncidents(incident, { limit: 5, threshold: 25 });
+  const similar = await findSimilarIncidents(incident, { limit: 5, threshold: 25, config });
 
   // ── Step 4 & 5: Generate + rank hypotheses ───────────────────────────────
   const hypotheses = generateHypotheses(context, similar);

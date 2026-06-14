@@ -17,8 +17,9 @@
  *   payload: { log_id, timestamp, level, service, path, message }
  */
 
-const { QdrantClient } = require('@qdrant/js-client-rest');
-const { getVectorSize } = require('./embedder');
+// QdrantClient and embedder are OPTIONAL — required lazily inside connect()
+// so that `require('logpilot')` never throws if @qdrant/js-client-rest
+// (or its dependency tree) isn't installed. Falls back to keyword search.
 
 const COLLECTION_NAME = 'logpilot_logs';
 
@@ -33,6 +34,16 @@ let connectionAttempted = false;
 async function connect(qdrantUrl = 'http://localhost:6333') {
   if (connectionAttempted) return connected;
   connectionAttempted = true;
+
+  let QdrantClient, getVectorSize;
+  try {
+    QdrantClient = require('@qdrant/js-client-rest').QdrantClient;
+    getVectorSize = require('./embedder').getVectorSize;
+  } catch (_) {
+    // @qdrant/js-client-rest not installed — semantic search disabled,
+    // keyword search still works.
+    return connected;
+  }
 
   try {
     client = new QdrantClient({ url: qdrantUrl });

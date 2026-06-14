@@ -381,14 +381,15 @@ function getIncidentTimeline(groupId, limit = 100) {
 }
 
 function upsertIncidentAnalysis(incidentId, analysis) {
-  if (!db || !incidentId) return;
+  const id = Number(incidentId);
+  if (!db || !Number.isFinite(id)) return;
   try {
     db.run(
       `INSERT OR REPLACE INTO incident_analysis
        (incident_id, updated_at, context_json, rca_json, recovery_json, postmortem_md)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
-        incidentId,
+        id,
         Date.now(),
         JSON.stringify(analysis.context || {}),
         JSON.stringify(analysis.rca || {}),
@@ -401,8 +402,9 @@ function upsertIncidentAnalysis(incidentId, analysis) {
 }
 
 function getIncidentAnalysis(incidentId) {
-  if (!db || !incidentId) return null;
-  const row = execQuery(`SELECT * FROM incident_analysis WHERE incident_id = ? LIMIT 1`, [incidentId])[0];
+  const id = Number(incidentId);
+  if (!db || !Number.isFinite(id)) return null;
+  const row = execQuery(`SELECT * FROM incident_analysis WHERE incident_id = ? LIMIT 1`, [id])[0];
   if (!row) return null;
   return {
     incidentId: row.incident_id,
@@ -570,12 +572,13 @@ function queryMetrics({ since, until, limit = 120 } = {}) {
 }
 
 function saveEvidenceSnapshot(incidentId, bundle) {
-  if (!db) return;
+  const id = Number(incidentId);
+  if (!db || !Number.isFinite(id)) return;
   try {
     db.run(
       `INSERT OR REPLACE INTO evidence_snapshots (incident_id, created_at, source, evidence_json, ttl_seconds)
        VALUES (?, ?, ?, ?, ?)`,
-      [incidentId, Date.now(), bundle.source || 'local', JSON.stringify(bundle), 3600]
+      [id, Date.now(), bundle.source || 'local', JSON.stringify(bundle), 3600]
     );
     persistDB();
   } catch (err) {
@@ -584,11 +587,12 @@ function saveEvidenceSnapshot(incidentId, bundle) {
 }
 
 function getEvidenceSnapshot(incidentId) {
-  if (!db) return null;
+  const id = Number(incidentId);
+  if (!db || !Number.isFinite(id)) return null;
   try {
     const rows = execQuery(
       `SELECT * FROM evidence_snapshots WHERE incident_id = ? LIMIT 1`,
-      [incidentId]
+      [id]
     );
     return rows[0] || null;
   } catch (err) {

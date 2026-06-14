@@ -5,6 +5,10 @@
  *
  * The model downloads once (~25MB) to ~/.cache/huggingface on first run.
  * All inference runs locally — no API keys, no internet after first download.
+ *
+ * @huggingface/transformers is an OPTIONAL dependency. If it isn't installed
+ * (or fails to install on a restricted network), logpilot falls back to
+ * keyword search automatically — nothing else is affected.
  */
 
 let embedder = null;

@@ -12,8 +12,9 @@ async function verifyRecovery(incident, config = {}) {
   // Try Splunk first if enabled
   if (config.splunk?.enabled) {
     try {
+      const earliestMin = Math.max(1, Math.round(windowMs / 60000));
       const splunkResult = await searchSplunk(
-        `search index=${config.splunk.index} path="${incident.path}" earliest=-5m`,
+        `search index=${config.splunk.index || 'logpilot'} path="${incident.path}" earliest=-${earliestMin}m`,
         config
       );
       if (splunkResult?.events?.length) {
