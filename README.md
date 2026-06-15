@@ -29,28 +29,26 @@ add `logpilot.config.js` for Splunk, AI providers, and custom heal rules.
 
 ---
 
-## Why Splunk-first?
+## Architecture: Agentic Ops Layer on Splunk
 
-Most "AI wrapped around logs" tools treat Splunk as an export target — data
-goes in, nothing useful comes back out. LogPilot flips that:
+LogPilot is the **agentic operations layer** that sits on top of Splunk.
+Each layer does what it does best — nothing overlaps.
 
-- **Splunk is the system of record.** `/api/incidents` reads from Splunk first
-  (via SPL search over your HEC-ingested events) and only falls back to local
-  SQLite if Splunk is unavailable — so the dashboard keeps working in a demo
-  even without a live Splunk instance.
-- **Splunk MCP tools drive the investigation.** The AI Investigator calls a
-  tool-use loop (`search_logs`, `find_deployments`, `get_trace`,
-  `find_related_incidents`, `get_metric_history`, `get_heal_history`,
-  `simulate_recovery`, `estimate_blast_radius`, `predict_incident_growth`,
-  `estimate_mttr`, `explain_failure_pattern`) — 11 tools an LLM can call to
-  build its own investigation plan.
-- **Splunk MLTK powers predictions.** The Predictions page generates SPL using
-  Splunk's Machine Learning Toolkit (`DensityFunction`, `StateSpaceForecast`,
-  logistic regression) to forecast latency spikes, memory exhaustion, and
-  overall outage risk — before they become incidents.
-- **Everything degrades gracefully.** No Splunk? No problem — every feature
-  above has a deterministic local fallback using SQLite, so the dashboard,
-  RCA, and recovery flow all still work for local development and demos.
+| Layer | Responsibilities |
+|---|---|
+| **Splunk** | Data ingestion (HEC), SPL search, dashboards, `predict` forecasting, alerting |
+| **LogPilot** | AI analysis, autonomous incident investigation, recommendations, operational workflows |
+
+Splunk ingests and stores every request, metric, and heal event from LogPilot
+in real time. LogPilot reads it back through SPL search — so Splunk is the
+system of record, not just a log drain.
+
+**What LogPilot adds on top of Splunk:**
+- 11 Splunk MCP tools the AI Investigator uses to build its own investigation plan
+- Autonomous Incident Commander: one click runs evidence → RCA → recovery → postmortem
+- Observability + forecast queries built on Splunk's native `predict` command (no MLTK app needed)
+- System metrics enrichment: every HEC event carries `cpuLoad`, `cpuCount`, `memoryPercent`, `memoryUsedMB`, `totalMemoryMB`, `heapUsedMB`, `heapTotalMB`, `rssMB`, `externalMB`, `eventLoopLagMs`
+- Graceful local fallback (SQLite) when Splunk is unavailable — demo works without live Splunk
 
 ---
 
@@ -163,6 +161,8 @@ SPLUNK_HEC_URL=https://localhost:8088
 SPLUNK_HEC_TOKEN=your-hec-token
 SPLUNK_USERNAME=admin
 SPLUNK_PASSWORD=your_password
+# Optional instead of username/password for Splunk REST search:
+# SPLUNK_TOKEN=your-rest-api-token
 SPLUNK_INDEX=logpilot
 SPLUNK_PROTOCOL=https
 ```
@@ -274,9 +274,11 @@ and the **Knowledge Graph** itself, grouped by node type.
 The **MLTK Predictions** page in the dashboard lists Splunk Machine Learning
 Toolkit searches for:
 
-- **Latency Spike Forecast** — `DensityFunction`-based outlier detection on response times
-- **Memory Exhaustion Forecast** — `StateSpaceForecast` 24h-ahead memory projection
-- **Outage Risk Score** — logistic regression combining error rate, latency, memory, and recent incidents
+- **Latency Forecast** — `predict responseTime future_timespan=10`
+- **CPU Forecast** — `predict cpuLoad future_timespan=10`
+- **Memory Forecast** — `predict memoryPercent future_timespan=10`
+
+Plus six observability queries (request volume, response time, CPU, memory, heap, error rate) that run live against your Splunk index.
 
 Each card shows the generated SPL, and "Run" executes it against Splunk,
 rendering results as dynamic bar charts. Without Splunk enabled, the SPL is
@@ -305,6 +307,7 @@ logpilot.init({
     port: 8089,
     username: process.env.SPLUNK_USERNAME,
     password: process.env.SPLUNK_PASSWORD,
+    searchToken: process.env.SPLUNK_TOKEN, // optional REST API bearer token
     index: 'logpilot',
     protocol: 'https',
     rejectUnauthorized: false // useful for local Splunk self-signed certs
@@ -378,6 +381,7 @@ module.exports = {
     port: process.env.SPLUNK_PORT || 8089,
     username: process.env.SPLUNK_USERNAME,
     password: process.env.SPLUNK_PASSWORD,
+    searchToken: process.env.SPLUNK_TOKEN,
     index: process.env.SPLUNK_INDEX || 'logpilot',
     protocol: process.env.SPLUNK_PROTOCOL || 'https',
     rejectUnauthorized: false,

@@ -143,7 +143,8 @@ function persistDB() {
   } catch (e) { /* silent */ }
 }
 
-setInterval(persistDB, 5000);
+const persistTimer = setInterval(persistDB, 5000);
+if (persistTimer.unref) persistTimer.unref();
 
 function insertLog(entry) {
   if (!db) return null;

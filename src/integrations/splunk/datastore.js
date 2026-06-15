@@ -129,13 +129,25 @@ async function searchEvidence(spl, config = {}) {
   return searchSplunk(spl, config);
 }
 
-function mltkQueries(config = {}) {
+function observabilityQueries(config = {}) {
   const index = indexName(config);
   return {
-    latencySpike: `| mstats avg(response_time) as latency where index=${index} span=1m by service | fit DensityFunction latency by service into logpilot_latency_model | apply logpilot_latency_model | where IsOutlier(latency)=1`,
-    memoryExhaustion: `search index=${index} type=metric earliest=-24h | timechart span=5m avg(memory) as memory by service | fit StateSpaceForecast memory holdback=20 into logpilot_memory_forecast | apply logpilot_memory_forecast | where upper95(memory)>90`,
-    outageRisk: `search index=${index} earliest=-4h (type=request OR type=metric OR type=incident) | bin _time span=5m | stats count(eval(statusCode>=500)) as errors avg(responseTime) as latency avg(memory) as memory count(eval(type="incident")) as incidents by _time service | eval risk=(errors*3)+(latency/500)+(memory/20)+(incidents*5) | fit LogisticRegression risk from errors latency memory incidents into logpilot_outage_risk | apply logpilot_outage_risk | where predicted(risk)>0.7`,
+    requestVolume:   { label: 'Request Volume',   icon: '\u{1F4CA}', category: 'observability', desc: 'Total requests per minute across all endpoints.',                              spl: `index=${index} | timechart span=1m count` },
+    responseTime:    { label: 'Response Time',    icon: '\u23F1',  category: 'observability', desc: 'Average response time per minute for all HTTP requests.',                     spl: `index=${index} sourcetype=logpilot:request | timechart span=1m avg(responseTime)` },
+    cpuUsage:        { label: 'CPU Load',         icon: '\u{1F5A5}', category: 'observability', desc: 'Average 1-min CPU load average per minute.',                                  spl: `index=${index} | timechart span=1m avg(cpuLoad)` },
+    memoryUsage:     { label: 'Memory Usage',     icon: '\u{1F9E0}', category: 'observability', desc: 'Average memory utilisation % per minute.',                                    spl: `index=${index} | timechart span=1m avg(memoryPercent)` },
+    heapUsage:       { label: 'Heap Usage',       icon: '\u{1F4BE}', category: 'observability', desc: 'Average Node.js heap used (MB) per minute.',                                  spl: `index=${index} | timechart span=1m avg(heapUsedMB)` },
+    errorRate:       { label: 'Error Rate',       icon: '\u26A0',  category: 'observability', desc: 'Number of HTTP 4xx/5xx responses per minute.',                                spl: `index=${index} statusCode>=400 | timechart span=1m count` },
+    latencyForecast: { label: 'Latency Forecast', icon: '\u{1F52E}', category: 'forecast',      desc: 'Forecasts avg response time 10 min ahead using Splunk predict (no MLTK app).', spl: `index=${index} sourcetype=logpilot:request\n| timechart span=1m avg(responseTime) as responseTime\n| predict responseTime future_timespan=10` },
+    cpuForecast:     { label: 'CPU Forecast',     icon: '\u{1F52E}', category: 'forecast',      desc: 'Forecasts CPU load 10 min ahead.',                                             spl: `index=${index}\n| timechart span=1m avg(cpuLoad) as cpuLoad\n| predict cpuLoad future_timespan=10` },
+    memoryForecast:  { label: 'Memory Forecast',  icon: '\u{1F52E}', category: 'forecast',      desc: 'Forecasts memory % 10 min ahead.',                                             spl: `index=${index}\n| timechart span=1m avg(memoryPercent) as memoryPercent\n| predict memoryPercent future_timespan=10` },
   };
+}
+
+// Legacy alias — keeps existing callers working
+function mltkQueries(config = {}) {
+  const q = observabilityQueries(config);
+  return { latencySpike: q.latencyForecast.spl, memoryExhaustion: q.memoryForecast.spl, outageRisk: q.cpuForecast.spl };
 }
 
 module.exports = {
@@ -144,6 +156,7 @@ module.exports = {
   getIncidentEvents,
   searchEvidence,
   mltkQueries,
+  observabilityQueries,
   normalizeIncident,
   normalizeEvent,
   indexName,

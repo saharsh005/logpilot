@@ -1148,148 +1148,199 @@ function renderSplunkHealth(data) {
 async function retestSplunkConnectivity() { fetchSplunkHealth(); }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  MLTK PREDICTIONS PAGE — Splunk Machine Learning Toolkit predictive searches
+//  ANALYTICS & FORECASTS PAGE — replaces old MLTK Predictions page
+//  Parts 3, 4, 5, 6 of the upgrade spec
 // ═══════════════════════════════════════════════════════════════════════════
 
-const PREDICTION_META = {
-  latencySpike: {
-    label: 'Latency Spike Forecast',
-    icon: '⚡',
-    desc: 'Flags services whose response time is an outlier vs. its modeled distribution (DensityFunction).',
-    color: '#EF9F27',
-  },
-  memoryExhaustion: {
-    label: 'Memory Exhaustion Forecast',
-    icon: '🧠',
-    desc: 'Forecasts memory usage 24h ahead (StateSpaceForecast) and flags services projected above 90% upper bound.',
-    color: '#E24B4A',
-  },
-  outageRisk: {
-    label: 'Outage Risk Score',
-    icon: '🚨',
-    desc: 'Combines error rate, latency, memory, and recent incidents into a logistic regression outage-risk score.',
-    color: '#7c3aed',
-  },
+const QUERY_COLORS = {
+  requestVolume:   '#378ADD',
+  responseTime:    '#EF9F27',
+  cpuUsage:        '#1D9E75',
+  memoryUsage:     '#E24B4A',
+  heapUsage:       '#7c3aed',
+  errorRate:       '#D85A30',
+  latencyForecast: '#0891b2',
+  cpuForecast:     '#059669',
+  memoryForecast:  '#dc2626',
 };
 
-function fetchPredictions() {
-  const el = document.getElementById('predictions-list');
+// ── Part 6: Connection-aware Splunk banner ──────────────────────────────────
+function renderSplunkBanner(splunkEnabled) {
+  const el = document.getElementById('splunk-analytics-banner');
   if (!el) return;
-  el.innerHTML = '<div class="empty-state"><p>Loading predictive searches…</p></div>';
+  if (splunkEnabled) {
+    el.innerHTML = `
+      <div style="background:linear-gradient(90deg,#1a2942,#1e3a5f);border:1px solid #2563eb;border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:12px">
+        <div style="width:10px;height:10px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,0.2);flex-shrink:0"></div>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:#93c5fd">Connected to Splunk · Live Predictive Analytics Available</div>
+          <div style="font-size:12px;color:#6b7280;margin-top:2px">Queries run against your Splunk index in real time. Forecasts use the built-in <code style="color:#93c5fd">predict</code> command — no MLTK app required.</div>
+        </div>
+        <button class="btn-primary" style="margin-left:auto;white-space:nowrap;flex-shrink:0" onclick="window.open('http://localhost:8000/en-US/app/search/dashboards','_blank')">
+          Open Splunk ↗
+        </button>
+      </div>`;
+  } else {
+    el.innerHTML = `
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 18px;display:flex;align-items:center;gap:12px">
+        <div style="width:10px;height:10px;border-radius:50%;background:#6b7280;flex-shrink:0"></div>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">Splunk not connected</div>
+          <div style="font-size:12px;color:var(--text2);margin-top:2px">
+            Connect Splunk Enterprise to enable live forecasting and advanced analytics.<br>
+            SPL queries are shown below for reference. Set <code>splunk.enabled: true</code> in your config to activate.
+          </div>
+        </div>
+        <button class="btn-outline" style="margin-left:auto;white-space:nowrap;flex-shrink:0" onclick="navigate('splunk')">
+          Setup Splunk
+        </button>
+      </div>`;
+  }
+}
+
+// ── Main page loader ────────────────────────────────────────────────────────
+function fetchPredictions() {
+  const obsEl  = document.getElementById('observability-list');
+  const fcastEl = document.getElementById('forecast-list');
+  if (!obsEl || !fcastEl) return;
 
   fetch('/api/commander/predictions').then(r => r.json()).then(data => {
-    const queries = data.queries || {};
-    const enabled = !!data.splunkEnabled;
+    const queries      = data.queries || {};
+    const splunkEnabled = !!data.splunkEnabled;
 
-    el.innerHTML = `
-      ${!enabled ? `
-        <div class="empty-state" style="margin-bottom:14px">
-          <div style="font-size:28px;margin-bottom:6px">🔌</div>
-          <p style="font-weight:600">Splunk is not enabled</p>
-          <p style="font-size:12px;color:var(--text4);margin-top:6px">
-            These predictive searches are generated below for reference, but require <code>splunk.enabled: true</code>
-            and the MLTK app to actually run against live data.
-          </p>
-        </div>` : ''}
-      <div class="grid2" style="gap:14px">
-        ${Object.entries(queries).map(([name, spl]) => {
-          const meta = PREDICTION_META[name] || { label: name, icon: '📊', desc: '', color: '#378ADD' };
-          return `
-          <div class="card">
-            <div class="card-header">
-              <div class="card-title">${meta.icon} ${esc(meta.label)}</div>
-              <div class="card-action" onclick="runPrediction('${name}')" id="run-btn-${name}">▶ Run</div>
-            </div>
-            <div style="font-size:12px;color:var(--text2);margin-bottom:8px;line-height:1.5">${esc(meta.desc)}</div>
-            <details style="margin-bottom:8px">
-              <summary style="font-size:11px;color:var(--text4);cursor:pointer">View SPL query</summary>
-              <pre style="font-size:10px;white-space:pre-wrap;background:var(--surface2);padding:8px;border-radius:6px;margin-top:6px;border:1px solid var(--border);overflow:auto">${esc(spl)}</pre>
-            </details>
-            <div id="pred-out-${name}">
-              <div class="empty-state" style="padding:14px 0"><p style="font-size:12px">Click "Run" to query Splunk MLTK${enabled ? '' : ' (disabled — will fall back to local evidence)'}.</p></div>
-            </div>
-          </div>`;
-        }).join('')}
-      </div>
-    `;
+    renderSplunkBanner(splunkEnabled);
+
+    const obsQueries    = Object.entries(queries).filter(([,q]) => q.category === 'observability');
+    const forecastQueries = Object.entries(queries).filter(([,q]) => q.category === 'forecast');
+
+    obsEl.innerHTML   = renderQueryCards(obsQueries, splunkEnabled);
+    fcastEl.innerHTML = renderQueryCards(forecastQueries, splunkEnabled);
+
   }).catch(err => {
-    el.innerHTML = `<div class="empty-state"><p style="color:var(--red)">Failed to load predictions: ${esc(err.message)}</p></div>`;
+    const msg = `<div class="empty-state"><p style="color:var(--red)">Failed: ${esc(err.message)}</p></div>`;
+    if (obsEl) obsEl.innerHTML = msg;
+    if (fcastEl) fcastEl.innerHTML = msg;
   });
 }
 
-function runPrediction(name) {
-  const out = document.getElementById('pred-out-' + name);
+function renderQueryCards(entries, splunkEnabled) {
+  if (!entries.length) return '<div class="empty-state"><p style="font-size:12px">No queries in this category.</p></div>';
+  return entries.map(([name, q]) => `
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">${q.icon || '📊'} ${esc(q.label)}</div>
+        <div class="card-action" onclick="runAnalyticsQuery('${name}')" id="run-btn-${name}">
+          ${splunkEnabled ? '▶ Run' : 'View SPL'}
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px;line-height:1.5">${esc(q.desc)}</div>
+      <details style="margin-bottom:8px">
+        <summary style="font-size:11px;color:var(--text4);cursor:pointer">View SPL query</summary>
+        <pre style="font-size:10px;white-space:pre-wrap;background:var(--surface2);padding:8px;border-radius:6px;margin-top:6px;border:1px solid var(--border);overflow:auto;max-height:120px">${esc(q.spl)}</pre>
+      </details>
+      <div id="query-out-${name}">
+        <div class="empty-state" style="padding:10px 0">
+          <p style="font-size:11px">${splunkEnabled ? 'Click "Run" to execute against Splunk.' : 'Connect Splunk to run this query live.'}</p>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+// ── Query execution + dynamic chart rendering ───────────────────────────────
+function runAnalyticsQuery(name) {
+  const out = document.getElementById('query-out-' + name);
   const btn = document.getElementById('run-btn-' + name);
   if (!out) return;
-  if (btn) btn.textContent = '⏳ Running…';
-  out.innerHTML = '<div class="empty-state" style="padding:14px 0"><p style="font-size:12px">Querying Splunk…</p></div>';
+  if (btn) { btn.textContent = '⏳'; btn.style.pointerEvents = 'none'; }
+  out.innerHTML = '<div class="empty-state" style="padding:10px 0"><p style="font-size:11px">Querying Splunk…</p></div>';
 
-  fetch('/api/commander/predictions/run?name=' + encodeURIComponent(name)).then(r => r.json()).then(data => {
-    if (btn) btn.textContent = '▶ Run';
-    if (data.error) {
-      out.innerHTML = `<div class="empty-state" style="padding:14px 0"><p style="font-size:12px;color:var(--red)">${esc(data.error)}: ${esc(data.message||'')}</p></div>`;
-      return;
-    }
-    const events = data.events || [];
-    const meta = PREDICTION_META[name] || { color: '#378ADD' };
+  fetch('/api/commander/predictions/run?name=' + encodeURIComponent(name))
+    .then(r => r.json())
+    .then(data => {
+      if (btn) { btn.textContent = '▶ Run'; btn.style.pointerEvents = ''; }
+      if (data.error) {
+        out.innerHTML = `<div class="empty-state" style="padding:10px 0"><p style="font-size:11px;color:var(--red)">${esc(data.error)}: ${esc(data.message||'')}</p></div>`;
+        return;
+      }
+      const events = data.events || [];
+      const color  = QUERY_COLORS[name] || '#378ADD';
 
-    if (!events.length) {
+      if (!events.length) {
+        out.innerHTML = `
+          <div class="empty-state" style="padding:10px 0">
+            <p style="font-size:11px">No data returned — source: ${esc(data.source||'local')}</p>
+            <p style="font-size:10px;color:var(--text4);margin-top:3px">No events in the index yet, or Splunk returned an empty result.</p>
+          </div>`;
+        return;
+      }
+
       out.innerHTML = `
-        <div class="empty-state" style="padding:14px 0">
-          <p style="font-size:12px">No anomalies detected — source: ${esc(data.source||'local')}</p>
-          <p style="font-size:11px;color:var(--text4);margin-top:4px">Either nothing is outside the model bounds right now, or there isn't enough history yet to fit the model.</p>
+        <div style="font-size:10px;color:var(--text4);margin-bottom:6px">${events.length} result(s) · source: ${esc(data.source||'local')} · label: ${esc(data.label||name)}</div>
+        ${renderAnalyticsChart(name, events, color)}
+        <div class="evidence-list" style="margin-top:8px;max-height:120px;overflow-y:auto">
+          ${events.slice(0,6).map(e => `
+            <div class="evidence-item" style="padding:5px 10px;display:flex;flex-wrap:wrap;gap:8px;font-size:10px">
+              ${Object.entries(e).filter(([k]) => !k.startsWith('_')).slice(0,5).map(([k,v]) =>
+                `<span><span style="color:var(--text4)">${esc(k)}:</span> <span style="color:var(--text)">${esc(String(v).slice(0,30))}</span></span>`
+              ).join('')}
+            </div>`).join('')}
         </div>`;
-      return;
-    }
-
-    out.innerHTML = `
-      <div style="font-size:11px;color:var(--text4);margin-bottom:8px">${events.length} result(s) · source: ${esc(data.source||'local')}</div>
-      ${renderPredictionChart(name, events, meta.color)}
-      <div class="evidence-list" style="margin-top:8px">
-        ${events.slice(0, 8).map(e => `
-          <div class="evidence-item" style="padding:6px 10px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
-            ${Object.entries(e).filter(([k]) => !k.startsWith('_')).slice(0, 6).map(([k, v]) =>
-              `<span style="font-size:11px"><span style="color:var(--text4)">${esc(k)}:</span> ${esc(String(v))}</span>`
-            ).join('')}
-          </div>
-        `).join('')}
-      </div>
-    `;
-  }).catch(err => {
-    if (btn) btn.textContent = '▶ Run';
-    out.innerHTML = `<div class="empty-state" style="padding:14px 0"><p style="font-size:12px;color:var(--red)">${esc(err.message)}</p></div>`;
-  });
+    })
+    .catch(err => {
+      if (btn) { btn.textContent = '▶ Run'; btn.style.pointerEvents = ''; }
+      out.innerHTML = `<div class="empty-state" style="padding:10px 0"><p style="font-size:11px;color:var(--red)">${esc(err.message)}</p></div>`;
+    });
 }
 
-// Renders a dynamic SVG bar chart from arbitrary numeric fields in the result rows
-function renderPredictionChart(name, events, color) {
-  // pick the first numeric field (excluding internal/time fields) across rows as the chart value
+// Dynamic SVG bar chart — picks first usable numeric field automatically
+function renderAnalyticsChart(name, events, color) {
   const sample = events[0] || {};
-  const numericKey = Object.keys(sample).find(k => {
-    if (k.startsWith('_') || /time|service|path|host/i.test(k)) return false;
-    const v = Number(sample[k]);
-    return !Number.isNaN(v);
-  });
-  if (!numericKey) return '';
 
-  const vals = events.map(e => Number(e[numericKey]) || 0);
+  // prefer known field names first, then fallback to first numeric field
+  const knownKeys = ['count','responseTime','cpuLoad','memoryPercent','heapUsedMB','avg(responseTime)','avg(cpuLoad)','avg(memoryPercent)','avg(heapUsedMB)'];
+  let valueKey = knownKeys.find(k => sample[k] !== undefined && !isNaN(Number(sample[k])));
+  if (!valueKey) {
+    valueKey = Object.keys(sample).find(k => {
+      if (k.startsWith('_') || /time|service|path|host|source/i.test(k)) return false;
+      return !isNaN(Number(sample[k]));
+    });
+  }
+  if (!valueKey) return '<div style="font-size:10px;color:var(--text4);padding:4px 0">No numeric field found for chart</div>';
+
+  const vals   = events.map(e => Number(e[valueKey]) || 0);
   const labels = events.map(e => e.service || e.path || e._time || '');
-  const max = Math.max(...vals, 1);
-  const W = 100, H = 60;
-  const barW = Math.max(4, Math.floor(W / vals.length) - 2);
+  const max    = Math.max(...vals, 1);
+
+  // ── SVG bar chart ───────────────────────────────────────────────────────
+  const W = vals.length;
+  const barW = Math.max(3, Math.floor(100 / W) - 1);
+  const H = 48;
 
   const bars = vals.map((v, i) => {
-    const h = Math.max(2, Math.round((v / max) * (H - 4)));
-    const x = i * (barW + 2);
-    return `<rect x="${x}" y="${H - h}" width="${barW}" height="${h}" fill="${color}" rx="1">
-      <title>${esc(String(labels[i]))}: ${esc(String(v))}</title>
+    const h  = Math.max(2, Math.round((v / max) * (H - 6)));
+    const x  = i * (barW + 1);
+    const isHigh = name.includes('error') || name.includes('Forecast') ? v > max * 0.75 : false;
+    const fill = isHigh ? '#E24B4A' : color;
+    return `<rect x="${x}" y="${H - h}" width="${barW}" height="${h}" fill="${fill}" rx="1" opacity="0.9">
+      <title>${esc(String(labels[i]).slice(0,30))}: ${v.toFixed(2)}</title>
     </rect>`;
   }).join('');
 
+  // add a subtle average line
+  const avg = vals.reduce((a,b)=>a+b,0) / vals.length;
+  const avgY = H - Math.round((avg / max) * (H - 6));
+  const totalW = W * (barW + 1);
+
   return `
     <div style="margin-top:4px">
-      <div style="font-size:10px;color:var(--text4);margin-bottom:4px">${esc(numericKey)} by ${labels[0] ? 'service/path' : 'result'}</div>
-      <svg width="100%" height="60" viewBox="0 0 ${vals.length * (barW + 2)} ${H}" preserveAspectRatio="none" style="display:block">${bars}</svg>
-    </div>
-  `;
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text4);margin-bottom:3px">
+        <span>${esc(valueKey)}</span>
+        <span>max: ${max.toFixed(1)} · avg: ${avg.toFixed(1)}</span>
+      </div>
+      <svg width="100%" height="${H}" viewBox="0 0 ${totalW} ${H}" preserveAspectRatio="none" style="display:block;border-radius:4px;background:var(--bg2)">
+        ${bars}
+        <line x1="0" y1="${avgY}" x2="${totalW}" y2="${avgY}" stroke="${color}" stroke-width="1" stroke-dasharray="3,2" opacity="0.5"/>
+      </svg>
+      <div style="font-size:9px;color:var(--text4);margin-top:2px">— avg · ${vals.length} data point(s)</div>
+    </div>`;
 }

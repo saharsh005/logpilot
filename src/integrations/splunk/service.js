@@ -25,10 +25,10 @@ class SplunkService {
 
     this.startupDiagnostics = null;  // filled by init()
 
-    if (this.enabled && this.splunkConfig.token) {
+    if (this.enabled && this.splunkConfig.hecToken) {
       this.hec = new HECClient({
         hecUrl:             this.splunkConfig.hecUrl || `https://${this.splunkConfig.host}:8088`,
-        hecToken:           this.splunkConfig.hecToken || this.splunkConfig.token,
+        hecToken:           this.splunkConfig.hecToken,
         index:              this.splunkConfig.index   || 'logpilot',
         batchSize:          config.batchSize          || 100,
         flushInterval:      config.flushInterval      || 5000,
@@ -58,6 +58,8 @@ class SplunkService {
   // ── Typed event emitters ──────────────────────────────────────────────────
 
   sendRequest(data) {
+    const { collectMetrics } = require('../../core/metrics');
+    const m = collectMetrics();
     return this.sendEvent('request', {
       method:       data.method,
       path:         data.path,
@@ -66,6 +68,17 @@ class SplunkService {
       service:      data.service,
       level:        data.level,
       ip:           data.metadata?.ip,
+      // ── System snapshot at request time ──────────────────────────────
+      cpuLoad:        m.cpuLoad,
+      cpuCount:       m.cpuCount,
+      memoryPercent:  m.memoryPercent,
+      memoryUsedMB:   m.memoryUsedMB,
+      totalMemoryMB:  m.totalMemoryMB,
+      heapUsedMB:     m.heapUsedMB,
+      heapTotalMB:    m.heapTotalMB,
+      rssMB:          m.rssMB,
+      externalMB:     m.externalMB,
+      eventLoopLagMs: m.eventLoopLagMs,
     });
   }
 
@@ -154,12 +167,9 @@ class SplunkService {
       return this.startupDiagnostics;
     }
 
-    if (!this.hec) {
-      this.startupDiagnostics = { enabled: false, reason: 'No HEC token configured' };
-      return this.startupDiagnostics;
-    }
-
-    const connectivity = await this.hec.testConnectivity();
+    const connectivity = this.hec
+      ? await this.hec.testConnectivity()
+      : { ok: false, reason: 'No HEC token configured' };
     const searchStatus = await this._testSearch();
 
     this.startupDiagnostics = {
@@ -197,10 +207,13 @@ class SplunkService {
       hecStatus = { ok: false, reason: hecHealth?.lastError || 'unhealthy' };
     }
 
+    const searchStatus = this.startupDiagnostics?.search || await this._testSearch();
+
     return {
       enabled:          this.enabled,
       hecStatus,
       hecHealth,
+      searchStatus,
       startupDiagnostics: this.startupDiagnostics,
       index:            this.splunkConfig.index,
       host:             this.splunkConfig.host,
@@ -227,7 +240,11 @@ function initSplunkService(config = {}) {
         if (diag.hec?.ok) {
           console.log(chalk.cyan('[logpilot]'), chalk.green(`✓ Splunk HEC connectivity OK (${diag.hec.latencyMs}ms)`));
         } else {
-          console.warn(chalk.yellow('[logpilot] ⚠ Splunk HEC connectivity failed:'), diag.hec?.error || 'unknown');
+          const error = diag.hec?.error || diag.hec?.reason || 'unknown';
+          const tlsHint = /self-signed|certificate/i.test(error)
+            ? ' Set splunk.rejectUnauthorized=false or SPLUNK_REJECT_TLS=false for local Splunk.'
+            : '';
+          console.warn(chalk.yellow('[logpilot] ⚠ Splunk HEC connectivity failed:'), `${error}${tlsHint}`);
         }
       }).catch(() => {});
     });

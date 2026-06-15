@@ -26,13 +26,26 @@ function startMetricsCollection(intervalMs = 5000) {
         const splunk = getSplunkService();
         if (splunk?.isEnabled()) {
           splunk.sendEvent('metric', {
-            cpu: metric.cpu,
-            memory: metric.memoryPercent,
-            memoryMb: metric.memoryMb,
-            eventLoopLag: metric.eventLoopLag,
-            heapUsedMb: metric.heapUsedMb,
-            heapTotalMb: metric.heapTotalMb,
-            timestamp: metric.timestamp,
+            // CPU
+            cpuLoad:      metric.cpuLoad,
+            cpuCount:     metric.cpuCount,
+            cpu:          metric.cpu,
+            // Memory
+            memoryPercent:  metric.memoryPercent,
+            memoryUsedMB:   metric.memoryUsedMB,
+            totalMemoryMB:  metric.totalMemoryMB,
+            memoryMb:       metric.memoryMb,
+            // Heap
+            heapUsedMB:   metric.heapUsedMB,
+            heapTotalMB:  metric.heapTotalMB,
+            rssMB:        metric.rssMB,
+            externalMB:   metric.externalMB,
+            heapUsedMb:   metric.heapUsedMb,
+            heapTotalMb:  metric.heapTotalMb,
+            // Event loop
+            eventLoopLagMs: metric.eventLoopLagMs,
+            eventLoopLag:   metric.eventLoopLag,
+            timestamp:    metric.timestamp,
           }).catch(() => {});
         }
       });
@@ -45,22 +58,50 @@ function startMetricsCollection(intervalMs = 5000) {
 }
 
 function collectMetrics() {
+  const os  = require('os');
   const mem = process.memoryUsage();
-  const totalMem = require('os').totalmem();
-  const memMb = Math.round(mem.rss / 1024 / 1024);
-  const memPercent = Math.round((mem.rss / totalMem) * 100);
 
-  // CPU usage approximation via process.cpuUsage()
-  const cpuUsage = process.cpuUsage();
+  // ── CPU ────────────────────────────────────────────────────────────────
+  const cpuLoad  = os.loadavg()[0];          // 1-min load average
+  const cpuCount = os.cpus().length;
+
+  // Legacy percent approximation (kept for existing dashboard charts)
+  const cpuUsage   = process.cpuUsage();
   const cpuPercent = Math.min(100, Math.round((cpuUsage.user + cpuUsage.system) / 10000 / 100));
 
+  // ── Memory ────────────────────────────────────────────────────────────
+  const totalMem       = os.totalmem();
+  const totalMemoryMB  = Math.round(totalMem / 1024 / 1024);
+  const memoryUsedMB   = Math.round((totalMem - os.freemem()) / 1024 / 1024);
+  const memoryPercent  = Math.round(((totalMem - os.freemem()) / totalMem) * 100);
+  const memMb          = memoryUsedMB;    // alias kept for existing callers
+
+  // ── Node heap ─────────────────────────────────────────────────────────
+  const heapUsedMB  = Math.round(mem.heapUsed  / 1024 / 1024);
+  const heapTotalMB = Math.round(mem.heapTotal  / 1024 / 1024);
+  const rssMB       = Math.round(mem.rss        / 1024 / 1024);
+  const externalMB  = Math.round(mem.external   / 1024 / 1024);
+
   return {
-    cpu: cpuPercent,
-    memoryMb: memMb,
-    memoryPercent: memPercent,
+    // ── Canonical field names (task spec) ────────────────────────────────
+    cpuLoad,
+    cpuCount,
+    memoryPercent,
+    memoryUsedMB,
+    totalMemoryMB,
+    heapUsedMB,
+    heapTotalMB,
+    rssMB,
+    externalMB,
+    eventLoopLagMs: eventLoopLag,
+
+    // ── Legacy aliases (keep existing dashboard/db callers working) ───────
+    cpu:          cpuPercent,
+    memoryMb:     memMb,
+    heapUsedMb:   heapUsedMB,
+    heapTotalMb:  heapTotalMB,
     eventLoopLag,
-    heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
-    heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+
     timestamp: Date.now(),
   };
 }

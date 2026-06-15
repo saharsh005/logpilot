@@ -21,7 +21,7 @@ module.exports = {
 
     // HTTP Event Collector (HEC) — for sending events TO Splunk
     hecUrl:             process.env.SPLUNK_HEC_URL   || 'https://localhost:8088',
-    token:              process.env.SPLUNK_HEC_TOKEN || '',   // HEC token
+    token:              process.env.SPLUNK_HEC_TOKEN || '',   // HEC token (alias: hecToken)
     index:              process.env.SPLUNK_INDEX     || 'logpilot',
 
     // Splunk REST API — for searching evidence FROM Splunk
@@ -29,8 +29,8 @@ module.exports = {
     port:               process.env.SPLUNK_PORT      || 8089,
     protocol:           process.env.SPLUNK_PROTOCOL  || 'https',
     username:           process.env.SPLUNK_USERNAME,           // basic auth
-    password:           process.env.SPLUNK_PASSWORD,           // or use token below
-    // token:           process.env.SPLUNK_TOKEN,              // bearer token for REST API
+    password:           process.env.SPLUNK_PASSWORD,
+    searchToken:        process.env.SPLUNK_TOKEN,              // optional REST API bearer token
 
     // TLS (set false for self-signed dev certs)
     rejectUnauthorized: process.env.SPLUNK_REJECT_TLS !== 'false',

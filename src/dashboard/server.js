@@ -19,6 +19,7 @@ const { generateRecommendations } = require('../recovery/recommendations');
 const { investigate } = require('../agent/investigator');
 const { getService: getSplunkService } = require('../integrations/splunk/service');
 const splunkDatastore = require('../integrations/splunk/datastore');
+const { observabilityQueries } = require('../integrations/splunk/datastore');
 const { commandIncident, listCommandableIncidents, getPredictiveSearches } = require('../commander/incidentCommander');
 const { buildKnowledgeGraph, dashboardVisualizationSpec } = require('../commander/knowledgeGraph');
 const { collectEvidence } = require('../investigator/evidence/collector');
@@ -301,9 +302,12 @@ function startDashboard(port = 4321, config = {}) {
   });
 
   // ── Incident Commander: Splunk-first autonomous pipeline ────────────────
+  // ── Observability + Predictive Analytics queries ──────────────────────────
   dashboardApp.get('/api/commander/predictions', apiRateLimit(20), (req, res) => {
     try {
-      res.json({ queries: getPredictiveSearches(config), splunkEnabled: !!getSplunkService()?.isEnabled() });
+      const splunkEnabled = !!getSplunkService()?.isEnabled();
+      const queries = observabilityQueries(config);
+      res.json({ queries, splunkEnabled });
     } catch (err) {
       res.status(500).json({ error: 'predictions failed', message: err.message });
     }
@@ -311,13 +315,14 @@ function startDashboard(port = 4321, config = {}) {
 
   dashboardApp.get('/api/commander/predictions/run', apiRateLimit(10), async (req, res) => {
     try {
-      const queries = getPredictiveSearches(config);
+      const queries = observabilityQueries(config);
       const name = req.query.name;
-      if (!name || !queries[name]) return res.status(400).json({ error: 'unknown prediction', available: Object.keys(queries) });
-      const result = await splunkDatastore.searchEvidence(queries[name], config);
-      res.json({ name, ...result });
+      if (!name || !queries[name]) return res.status(400).json({ error: 'unknown query', available: Object.keys(queries) });
+      const q = queries[name];
+      const result = await splunkDatastore.searchEvidence(q.spl, config);
+      res.json({ name, label: q.label, category: q.category, ...result });
     } catch (err) {
-      res.status(500).json({ error: 'prediction run failed', message: err.message });
+      res.status(500).json({ error: 'query run failed', message: err.message });
     }
   });
 
@@ -1041,7 +1046,7 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
     </div>
     <div class="sb-logo-text">
       <span class="sb-logo-name">LogPilot</span>
-      <span class="sb-logo-sub">Splunk Incident Commander</span>
+      <span class="sb-logo-sub">Agentic Ops Layer · Splunk</span>
     </div>
   </div>
 
@@ -1091,7 +1096,11 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
     </div>
     <div class="sb-item" id="nav-predictions" onclick="navigate('predictions')">
       <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11.707 4.707a1 1 0 00-1.414-1.414L10 9.586 8.707 8.293a1 1 0 00-1.414 0l-2 2a1 1 0 101.414 1.414L8 10.414l1.293 1.293a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
-      MLTK Predictions
+      Analytics &amp; Forecasts
+    </div>
+    <div class="sb-item" id="nav-open-splunk" onclick="window.open('http://localhost:8000/en-US/app/search/dashboards','_blank')" title="Open Splunk Analytics">
+      <svg class="sb-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z"/><path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z"/></svg>
+      Open Splunk Analytics
     </div>
   </div>
 
@@ -1409,17 +1418,33 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:'
 
   <!-- MLTK PREDICTIONS PAGE -->
   <div class="page" id="page-predictions">
-    <h1 class="page-title">MLTK Predictions</h1>
-    <div class="card" style="margin-bottom:16px">
-      <div class="card-header"><div class="card-title">Splunk Machine Learning Toolkit — Predictive Searches</div></div>
-      <div style="padding:4px 0;font-size:13px;color:var(--text2);line-height:1.6">
-        These SPL queries use Splunk MLTK to forecast latency spikes, memory exhaustion, and overall outage risk
-        directly from data stored in Splunk — turning raw telemetry into early warnings before incidents occur.
-        Requires <code>splunk.enabled: true</code> with the MLTK app installed on your Splunk instance.
+    <h1 class="page-title">Analytics &amp; Forecasts</h1>
+
+    <!-- Part 6: Splunk connection banner — dynamic, filled by JS -->
+    <div id="splunk-analytics-banner" style="margin-bottom:16px"></div>
+
+    <!-- Part 5: Open Splunk button -->
+    <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
+      <button class="btn-primary" onclick="window.open('http://localhost:8000/en-US/app/search/dashboards','_blank')" style="display:flex;align-items:center;gap:6px">
+        <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z"/><path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z"/></svg>
+        Open Splunk Analytics
+      </button>
+    </div>
+
+    <!-- Observability queries (Part 3) -->
+    <div style="margin-bottom:8px">
+      <div class="section-label" style="margin-bottom:10px">Observability — Live SPL</div>
+      <div id="observability-list" class="grid2" style="gap:12px">
+        <div class="empty-state"><p style="font-size:12px">Loading…</p></div>
       </div>
     </div>
-    <div id="predictions-list">
-      <div class="empty-state"><p>Loading predictive searches…</p></div>
+
+    <!-- Forecast queries (Part 4) -->
+    <div style="margin-top:20px">
+      <div class="section-label" style="margin-bottom:10px">Predictive Analytics — Splunk predict (no MLTK required)</div>
+      <div id="forecast-list" class="grid2" style="gap:12px">
+        <div class="empty-state"><p style="font-size:12px">Loading…</p></div>
+      </div>
     </div>
   </div>
 </div>
